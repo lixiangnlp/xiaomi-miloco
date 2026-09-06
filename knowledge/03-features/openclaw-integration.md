@@ -100,7 +100,17 @@ before_prompt_build Hook（plugins/openclaw/src/hooks/prompt.ts）
 
 **before_prompt_build Hook（`hooks/prompt.ts`，唯一一处）**
 
-每次 Agent turn 前按会话 profile（`resolveProfile` 分 full / rule / suggestion / minimal）装配系统上下文，分 prepend 指令块（身份与家庭能力 / 能力概览 / 感知格式 / 通知与输出约定）与 append 数据块（今日感知日志、待回应习惯建议、设备目录 catalog）两部分。今日感知日志由 `buildPerceptionLogBlock` 读工作区 `memory/<date>-miloco-perception.md`；家庭档案改由 agent 用 `home-profile list` 按需自取，不再注入。关键设计决策：isolated cron 走 minimal——剥掉家庭记忆等块与全部 append 数据，避免定时任务继承主 agent 人格。各块装配见 `hooks/prompt.ts`。
+每次 Agent turn 前按会话 profile（`resolveProfile` 分 full / rule / suggestion / minimal）装配系统上下文，分 prepend 指令块（身份与家庭能力 / 能力概览 / 感知格式 / 通知与输出约定 / 按 profile 预载的 skill 正文）与 append 数据块（今日感知日志、待回应习惯建议、设备目录 catalog）两部分。今日感知日志由 `buildPerceptionLogBlock` 读工作区 `memory/<date>-miloco-perception.md`；家庭档案改由 agent 用 `home-profile list` 按需自取，不再注入。关键设计决策：isolated cron 走 minimal——剥掉家庭记忆等块与全部 append 数据，避免定时任务继承主 agent 人格。各块装配见 `hooks/prompt.ts`。
+
+**按 profile 预注入 skill 正文（`resolvePreinject` + `services/skills.ts`）**：取舍依据是频率准则——与三分之一以上流量相关的内容进系统提示而非 skill；若某个 skill 能由 harness 已掌握的信号预测出来，就在首次模型调用前由 harness 注入、省掉“加载 skill”那一轮。profile 正是这样的信号：rule / suggestion 会话几乎总以一次通知收尾，TTS 又要经 `miloco-devices` 下发，原先危险预警热路径要先花两轮分别加载两个 skill。现在：
+
+| profile | 预载内容 | 触发条件 |
+| --- | --- | --- |
+| rule / suggestion | `miloco-notify` 全文 + `miloco-devices` 节选（步骤 2 / 4 / 5 与音箱 `play-text` vs `execute-text-directive` 一节） | 恒定 |
+| full | `miloco-notify` 全文 | 仅当正文以 `[感知引擎]` 开头（感知推送大概率要通知）；普通 IM 对话里通知是少数分支，保持“先读 skill”指针 |
+| minimal | `miloco-notify` 全文 + devices 节选 + catalog | 仅 `miloco-home-patrol` 巡检 cron（既控设备又通知）；digest / dreaming / habit 保持纯 minimal |
+
+实现约束：正文从插件自带的 `skills/<name>/SKILL.md` 读取（打包时由 `scripts/sync-skills.mjs` 从 `plugins/skills/` 复制；源码 / 测试环境回退读源目录），去 frontmatter 后**逐字**注入，不在 TS 里复写 skill 散文——devices 节选也是按标题 `extractSections` 切出来的，skill 改了注入自动跟随，标题改名会让节选变空并 warn。预载块紧随 `B_NOTIFY`、归在 prepend（静态，按文件 mtime 缓存），并明确写“已预载，勿再加载”；设备目录段第二段随之改为指向上方节选，不再要求先读完整 skill。预算守卫 `prompt.preinject_max_tokens`（共享配置，默认 4000，环境变量 `MILOCO_PROMPT__PREINJECT_MAX_TOKENS` 优先，`<=0` 关闭）：单块估算（CJK 1 字 ≈ 1 token，其余 4 字符 ≈ 1 token）超限即回退指针形态；skill 文件缺失同样只降级不抛。各 profile 的 prepend 估算规模写在 debug 日志里。Hermes 侧 `context_injection.py` 同步实现（`resolve_preinject` / `load_skill_body`），skill 目录按 `$HERMES_HOME/skills` → `plugins/hermes/skills` → `plugins/skills` 解析。
 
 **插件只赋能力、不赋身份（`B_IDENTITY`）**：本块逐轮 prepend 进宿主 agent 的系统上下文，早期写死「你是经验丰富的家庭智能管家 Miloco」，会盖掉宿主自己的人设——用户把 agent 设成"华人牌智能手机傻妞"，装上插件后再问"你是谁"就答成"家庭智能管家 Miloco"。现改为能力叙述 + 显式身份保全：名字 / 人设 / 语气一律沿用宿主既有设定。刻意不写「宿主没设身份就当管家」的兜底——那是宿主自己该管的事（openclaw 本就会引导用户去做身份设定），插件不该趁虚塞一个人格进去。Hermes 侧 `context_injection.B_IDENTITY` 与本块 1:1 同步（该文本还会进 `<system>` 消息，覆盖面更强）。
 

@@ -5,7 +5,9 @@ import {
   lockOnboardingSession,
   readOnboardingState,
 } from "../home-profile/onboarding_state.js";
+import { getPreinjectMaxTokens } from "../miloco/config.js";
 import { getCatalog } from "../services/catalog.js";
+import { estimateTokens, loadSkillBody } from "../services/skills.js";
 import { logger } from "../utils/logger.js";
 import { deployTimezone, toLocalParts } from "../utils/time.js";
 import type { HookRegister } from "./index.js";
@@ -35,6 +37,45 @@ export function resolveProfile(
   if (key.includes("miloco-rule")) return "rule";
   if (key.includes("miloco-suggest")) return "suggestion";
   return "full";
+}
+
+// ===== 按 profile 预注入 skill 正文 =====
+//
+// 频率准则：与三分之一以上流量相关的内容进系统提示，而不是让模型每次多花一轮去加载
+// skill；若某个 skill 能由 harness 已掌握的信号预测出来，就在首次模型调用前由 harness
+// 注入、省掉那一轮。这里 profile 就是那个信号：
+// - rule / suggestion 会话几乎总以一次通知收尾，TTS 又要经 miloco-devices 下发——
+//   原先危险预警的热路径要先花两轮分别加载两个 skill。→ 预载 notify 全文 + devices 节选。
+// - full（用户 IM 综合会话）里通知是少数分支，保持指针形态；但正文以 `[感知引擎]`
+//   开头（语音提醒等感知推送）时同样大概率要通知，此时也预载 notify。
+// - minimal（受管 cron）默认不带任何 skill，唯 miloco-home-patrol 巡检既控设备又通知，
+//   给它 notify + devices 节选 + catalog；其余 cron（digest / dreaming / habit）不变。
+type Preinject = { notify: boolean; devices: boolean; catalog: boolean };
+
+/** 感知引擎推送的正文 header（语音提醒 / 事件提醒 / 规则提醒都以它开头）。 */
+const PERCEPTION_HEADER = "[感知引擎]";
+
+/**
+ * 是否为家庭巡检 cron。openclaw 把 cron 消息重写成 `[cron:<jobId> <name>] …`，hermes 侧
+ * 的巡检 prompt 正文也点名该 skill；只在 profile 已判为 minimal 后调用，故按任务名子串判。
+ */
+export function isPatrolCron(prompt: string | undefined): boolean {
+  return (prompt ?? "").includes("miloco-home-patrol");
+}
+
+export function resolvePreinject(profile: Profile, prompt: string | undefined): Preinject {
+  if (profile === "rule" || profile === "suggestion") {
+    return { notify: true, devices: true, catalog: true };
+  }
+  if (profile === "full") {
+    return {
+      notify: (prompt ?? "").startsWith(PERCEPTION_HEADER),
+      devices: false,
+      catalog: true,
+    };
+  }
+  const patrol = isPatrolCron(prompt);
+  return { notify: patrol, devices: patrol, catalog: patrol };
 }
 
 // ===== prepend 指令块（静态） =====
@@ -131,6 +172,65 @@ const B_NOTIFY = `## 通知用户
 - **处理系统推送时你的回话对用户不可见**——光把结论写进回复，没有任何人收到，等于没通知。必须经本 skill 决策并交付渠道才算送达。
 - 通知要决策「给谁 → 走哪个渠道（TTS / IM / 米家推送）→ 说什么」，这套判断只在 skill 里；别绕过它直接裸调 \`miloco_im_push\` / \`miloco-cli notify push\` / TTS，否则容易选错人、选错渠道、说错话。`;
 
+const NOTIFY_SKILL = "miloco-notify";
+const DEVICES_SKILL = "miloco-devices";
+
+// devices 节选只取“定位设备 → 生成命令 → 安全分流”与音箱 TTS 指引这几节：足够发 TTS 和做
+// 一次简单控制。标题必须与 plugins/skills/miloco-devices/SKILL.md 逐字一致——按标题抽取
+// 而非在这里复制散文，skill 改了节选自动跟着变；标题改名会让节选变空并 warn。
+const DEVICES_EXCERPT_SECTIONS = [
+  "步骤 2 · 确定设备列表",
+  "步骤 4 · 生成指令",
+  "步骤 5 · 安全分流",
+  "智能音箱：`play-text` vs `execute-text-directive`",
+] as const;
+
+// 预载正文用四个反引号围栏：skill 正文自身含 ``` 代码块，三反引号会被内层提前闭合。
+const BODY_FENCE = "````";
+
+function fenceBody(body: string): string {
+  return `${BODY_FENCE}markdown\n${body}\n${BODY_FENCE}`;
+}
+
+/**
+ * notify skill 全文预载块。正文超 `prompt.preinject_max_tokens` 或读不到时返回空串，
+ * 调用方保留上方 B_NOTIFY 的指针形态即可（agent 仍会自行加载 skill，只是多一轮）。
+ */
+function buildPreloadedNotifyBlock(maxTokens: number): string {
+  if (maxTokens <= 0) return "";
+  const body = loadSkillBody(NOTIFY_SKILL);
+  if (!body) return "";
+  const tokens = estimateTokens(body);
+  if (tokens > maxTokens) {
+    logger.warn(
+      `miloco-notify 正文约 ${tokens} tokens，超过 prompt.preinject_max_tokens=${maxTokens}，回退为指针形态`,
+    );
+    return "";
+  }
+  return `## 通知技能（已预载）
+下面是 \`${NOTIFY_SKILL}\` skill 的完整正文，**已预载，勿再加载**——上方“通知用户”段要求先读的 skill 就是它，读完本段即算满足该前置，不要再调用 skill 加载器或去读 SKILL.md；直接按其中的工作流决策并交付。
+${fenceBody(body)}`;
+}
+
+/**
+ * devices skill 节选预载块：只覆盖定位音箱 / 发 TTS / 简单控制；复杂控制仍读完整 skill。
+ */
+function buildDevicesExcerptBlock(maxTokens: number): string {
+  if (maxTokens <= 0) return "";
+  const body = loadSkillBody(DEVICES_SKILL, { sections: DEVICES_EXCERPT_SECTIONS });
+  if (!body) return "";
+  const tokens = estimateTokens(body);
+  if (tokens > maxTokens) {
+    logger.warn(
+      `miloco-devices 节选约 ${tokens} tokens，超过 prompt.preinject_max_tokens=${maxTokens}，本轮不预载`,
+    );
+    return "";
+  }
+  return `## 设备技能节选（已预载）
+下面是 \`${DEVICES_SKILL}\` skill 中与“定位设备 → 生成命令 → 安全分流”及音箱 TTS 相关的节选，**已预载，勿再加载**：发 TTS（\`device action <did> play-text "<文案>"\`）或做一次简单控制 / 查询时直接照此执行，命令形态、\`play-text\` 与 \`execute-text-directive\` 的取舍、安全设备二次确认均以此为准。涉及多台批量、相对调节、厨房电器、场景触发等节选未覆盖的操作时，再加载完整 \`${DEVICES_SKILL}\` skill。
+${fenceBody(body)}`;
+}
+
 function buildOnboardingSessionBlock(
   sessionKey: string | undefined,
   prompt: string | undefined,
@@ -211,8 +311,19 @@ function buildTimezoneBlock(): string {
 // ===== append 数据块（动态） =====
 
 const DEVICE_CATALOG_INTRO = `## 设备目录
-下方 \`# devices catalog\` 是预注入的高频设备子集（≤50 台，非全量），字段规则见下方目录头部的注释。它**只用于快速拿到已点名单台设备的 did / spec_name**，不是全屋设备的全集。凡涉及设备**集合 / 多台 / 不确定数量**（无论查询还是控制），或目录里找不到目标，**必须先 \`device list\` 拉全量**再逐台处理，别拿子集当全部。
-**任何 \`device control / props / action\` 或 \`scene\` 命令前（含查询），必须先读 \`miloco-devices\` skill**——命令选择、集合判定、安全确认、补 on、错误处理等都在其中，别只凭本目录裸发。`;
+下方 \`# devices catalog\` 是预注入的高频设备子集（≤50 台，非全量），字段规则见下方目录头部的注释。它**只用于快速拿到已点名单台设备的 did / spec_name**，不是全屋设备的全集。凡涉及设备**集合 / 多台 / 不确定数量**（无论查询还是控制），或目录里找不到目标，**必须先 \`device list\` 拉全量**再逐台处理，别拿子集当全部。`;
+
+// 目录段的第二段按是否已预载 devices 节选二选一：预载了就指向上方节选，别再要求 agent 去
+// 读完整 skill（那正是本次要省掉的回合）；没预载则保留原“必须先读 skill”的硬前置。
+const DEVICE_CATALOG_SKILL_POINTER = `**任何 \`device control / props / action\` 或 \`scene\` 命令前（含查询），必须先读 \`miloco-devices\` skill**——命令选择、集合判定、安全确认、补 on、错误处理等都在其中，别只凭本目录裸发。`;
+const DEVICE_CATALOG_EXCERPT_POINTER = `下发 \`device control / props / action\` 前先按上方“设备技能节选（已预载）”的命令形态与安全分流执行，别只凭本目录裸发；节选未覆盖的复杂控制或 \`scene\` 命令再读完整 \`miloco-devices\` skill。`;
+
+function buildCatalogBlock(catalog: string, devicesPreloaded: boolean): string {
+  const pointer = devicesPreloaded ? DEVICE_CATALOG_EXCERPT_POINTER : DEVICE_CATALOG_SKILL_POINTER;
+  // 套 ```text 围栏：catalog 是类 TSV 数据块，行首 `#` 是注释前缀而非 markdown
+  // 标题，裸贴会让 `# devices catalog` 在 `## 设备目录`(H2) 下被解析成 H1 倒挂。
+  return `${DEVICE_CATALOG_INTRO}\n${pointer}\n\n\`\`\`text\n${catalog}\n\`\`\``;
+}
 
 // 感知日志逐轮全量注入、随一天增长会挤占上下文（它替换掉的家庭档案块原本按 token 截断），
 // 故设一个字符上限；超限时保留末尾（日志按时间追加，尾部即最近），并提示用 memory_search 查全量。
@@ -309,6 +420,9 @@ export const registerBeforePromptBuildHook: HookRegister = (api) => {
       trigger: ctx?.trigger,
     });
 
+    const pre = resolvePreinject(profile, event?.prompt);
+    const maxTokens = getPreinjectMaxTokens();
+
     // ---- prepend：指令块，按 §3 序 ----
     // 时区块紧随身份、置于所有 profile（含 minimal）——cron/suggestion lane 也须锚定家庭时区。
     const prepend: string[] = [B_IDENTITY, buildTimezoneBlock()];
@@ -317,9 +431,16 @@ export const registerBeforePromptBuildHook: HookRegister = (api) => {
     if (profile === "rule" && B_RULE_EXEC) prepend.push(B_RULE_EXEC);
     if (profile !== "minimal") prepend.push(B_MEMORY);
     if (B_CONSTRAINTS) prepend.push(B_CONSTRAINTS);
-    prepend.push(B_NOTIFY, B_LANGUAGE);
+    prepend.push(B_NOTIFY);
+    // 预载的 skill 正文是静态文本（随文件 mtime 变化），归在 prepend、紧随 B_NOTIFY；
+    // 易变数据一律留在 append，保持“静态在前、易变在后”的缓存友好顺序。
+    const notifyBlock = pre.notify ? buildPreloadedNotifyBlock(maxTokens) : "";
+    if (notifyBlock) prepend.push(notifyBlock);
+    const devicesBlock = pre.devices ? buildDevicesExcerptBlock(maxTokens) : "";
+    if (devicesBlock) prepend.push(devicesBlock);
+    prepend.push(B_LANGUAGE);
 
-    // ---- append：数据块（今日感知日志 → 待回应 → 目录），minimal 不带 ----
+    // ---- append：数据块（今日感知日志 → 待回应 → 目录），minimal 只在巡检时带目录 ----
     const append: string[] = [];
     if (profile !== "minimal") {
       const onboardingBlock = buildOnboardingSessionBlock(
@@ -335,16 +456,21 @@ export const registerBeforePromptBuildHook: HookRegister = (api) => {
         const pending = buildPendingSuggestionBlock();
         if (pending) append.push(pending);
       }
-
+    }
+    if (pre.catalog) {
       // catalog 放最末（最易变）；CLI 失败回退空串则整段不出现。
-      // 套 ```text 围栏：catalog 是类 TSV 数据块，行首 `#` 是注释前缀而非 markdown
-      // 标题，裸贴会让 `# devices catalog` 在 `## 设备目录`(H2) 下被解析成 H1 倒挂。
       const catalog = await getCatalog();
-      if (catalog) append.push(`${DEVICE_CATALOG_INTRO}\n\n\`\`\`text\n${catalog}\n\`\`\``);
+      if (catalog) append.push(buildCatalogBlock(catalog, Boolean(devicesBlock)));
     }
 
+    const prependText = prepend.join("\n\n");
+    logger.debug(
+      `before_prompt_build profile=${profile} prepend≈${estimateTokens(prependText)} tokens` +
+        `（notify 预载 ${notifyBlock ? estimateTokens(notifyBlock) : 0}，devices 节选 ${devicesBlock ? estimateTokens(devicesBlock) : 0}）`,
+    );
+
     return {
-      prependSystemContext: prepend.join("\n\n"),
+      prependSystemContext: prependText,
       appendSystemContext: append.length ? append.join("\n\n") : undefined,
     };
   });

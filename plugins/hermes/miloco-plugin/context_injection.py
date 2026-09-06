@@ -20,13 +20,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .catalog import get_catalog
+from .config import load_shared_config
 from .paths import miloco_home
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,246 @@ def resolve_profile(
     if "miloco-suggest" in key:
         return "suggestion"
     return "full"
+
+
+# ---------------------------------------------------------------------------
+# 按 profile 预注入 skill 正文（与 TS 端 resolvePreinject / services/skills.ts 对齐）
+# ---------------------------------------------------------------------------
+#
+# 频率准则：与三分之一以上流量相关的内容进系统提示，而不是让模型每次多花一轮去加载
+# skill；若某个 skill 能由 harness 已掌握的信号预测出来，就在首次模型调用前由 harness
+# 注入、省掉那一轮。这里 profile 就是那个信号：
+# - rule / suggestion 几乎总以一次通知收尾、TTS 又要经 miloco-devices 下发 → 预载
+#   notify 全文 + devices 节选；
+# - full 里通知是少数分支，保持指针形态；正文以 `[感知引擎]` 开头时也预载 notify；
+# - minimal 只有 miloco-home-patrol 巡检既控设备又通知 → notify + devices 节选 + catalog。
+
+NOTIFY_SKILL = "miloco-notify"
+DEVICES_SKILL = "miloco-devices"
+
+# devices 节选：与 TS 端 DEVICES_EXCERPT_SECTIONS 逐字一致，标题须与 SKILL.md 全等。
+DEVICES_EXCERPT_SECTIONS: Tuple[str, ...] = (
+    "步骤 2 · 确定设备列表",
+    "步骤 4 · 生成指令",
+    "步骤 5 · 安全分流",
+    "智能音箱：`play-text` vs `execute-text-directive`",
+)
+
+PERCEPTION_HEADER = "[感知引擎]"
+DEFAULT_PREINJECT_MAX_TOKENS = 4000
+
+_PLUGIN_DIR = Path(__file__).resolve().parent
+_skills_dir_override: Optional[Path] = None
+
+
+def _skills_dir_candidates() -> List[Path]:
+    """skill 根目录候选：``$HERMES_HOME/skills``（install-hermes.sh 安装位置）→
+    ``plugins/hermes/skills``（sync-skills.py 产物）→ ``plugins/skills``（源目录）。"""
+    if _skills_dir_override is not None:
+        return [_skills_dir_override]
+    hermes_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return [
+        hermes_home / "skills",
+        _PLUGIN_DIR.parent / "skills",
+        _PLUGIN_DIR.parents[1] / "skills",
+    ]
+
+
+def _set_skills_dir_override(path: Optional[Path]) -> None:
+    """仅为测试之用：强制指定 skill 根目录（None 恢复默认解析），同时清缓存。"""
+    global _skills_dir_override
+    _skills_dir_override = path
+    _reset_skill_cache()
+
+
+def skill_file_path(name: str) -> Optional[Path]:
+    """按候选目录顺序找第一个存在的 ``<name>/SKILL.md``；都没有返回 None。"""
+    for root in _skills_dir_candidates():
+        f = root / name / "SKILL.md"
+        if f.is_file():
+            return f
+    return None
+
+
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n?", re.DOTALL)
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+
+def strip_frontmatter(md: str) -> str:
+    """去掉首部 YAML frontmatter；无 frontmatter 原样返回。"""
+    m = _FRONTMATTER_RE.match(md)
+    return md[m.end():] if m else md
+
+
+def extract_sections(md: str, headings: Sequence[str]) -> str:
+    """按标题文本抽取小节（含标题行，止于下一同级或更高级标题），按传入顺序拼接。
+    标题去 ``#`` 前缀后按 strip 全等匹配；找不到的跳过，全找不到返回空串。"""
+    lines = md.splitlines()
+    out: List[str] = []
+    for wanted in headings:
+        target = wanted.strip()
+        start = -1
+        level = 0
+        for i, line in enumerate(lines):
+            m = _HEADING_RE.match(line)
+            if m and m.group(2).strip() == target:
+                start, level = i, len(m.group(1))
+                break
+        if start < 0:
+            continue
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            m = _HEADING_RE.match(lines[i])
+            if m and len(m.group(1)) <= level:
+                end = i
+                break
+        out.append("\n".join(lines[start:end]).strip())
+    return "\n\n".join(out)
+
+
+def estimate_tokens(text: str) -> int:
+    """粗估 token：CJK 1 字 ≈ 1 token，其余 4 字符 ≈ 1 token（与 TS 端 estimateTokens 同口径）。"""
+    cjk = 0
+    other = 0
+    for ch in text:
+        cp = ord(ch)
+        if 0x3000 <= cp <= 0x9FFF or 0xFF00 <= cp <= 0xFFEF:
+            cjk += 1
+        else:
+            other += 1
+    return cjk + (other + 3) // 4
+
+
+_skill_cache: Dict[str, Tuple[Path, float, str]] = {}
+_skill_warned: set = set()
+
+
+def _warn_once(name: str, message: str) -> None:
+    if name in _skill_warned:
+        return
+    _skill_warned.add(name)
+    logger.warning(message)
+
+
+def load_skill_body(name: str, sections: Optional[Sequence[str]] = None) -> str:
+    """读 skill 正文（去 frontmatter）；给 ``sections`` 则只取那些小节。
+    按 mtime 缓存；任何失败返回空串并 warn 一次，绝不抛。"""
+    key = f"{name}|{''.join(sections)}" if sections else name
+    try:
+        f = skill_file_path(name)
+        if f is None:
+            _warn_once(name, f"skill {name} 的 SKILL.md 不存在，预注入回退为指针形态")
+            return ""
+        mtime = f.stat().st_mtime
+        hit = _skill_cache.get(key)
+        if hit and hit[0] == f and hit[1] == mtime:
+            return hit[2]
+        body = strip_frontmatter(f.read_text(encoding="utf-8")).strip()
+        text = extract_sections(body, sections) if sections else body
+        if not text:
+            _warn_once(name, f"skill {name} 正文为空或未匹配到指定小节，预注入回退为指针形态")
+        else:
+            _skill_warned.discard(name)
+        _skill_cache[key] = (f, mtime, text)
+        return text
+    except Exception as exc:  # noqa: BLE001 - 预注入失败只降级
+        _warn_once(name, f"读取 skill {name} 失败，预注入回退为指针形态：{exc}")
+        return ""
+
+
+def _reset_skill_cache() -> None:
+    _skill_cache.clear()
+    _skill_warned.clear()
+
+
+def is_patrol_cron(user_message: Optional[str]) -> bool:
+    """是否为家庭巡检 cron：cron prompt 正文点名 ``miloco-home-patrol``（openclaw 侧的
+    ``[cron:<jobId> miloco-home-patrol]`` 前缀亦命中）。只在 profile 已判为 minimal 后调用。"""
+    return "miloco-home-patrol" in (user_message or "")
+
+
+def resolve_preinject(profile: Profile, user_message: Optional[str]) -> Dict[str, bool]:
+    """与 TS 端 ``resolvePreinject`` 等价：返回 ``{"notify", "devices", "catalog"}`` 三个开关。"""
+    if profile in ("rule", "suggestion"):
+        return {"notify": True, "devices": True, "catalog": True}
+    if profile == "full":
+        return {
+            "notify": (user_message or "").startswith(PERCEPTION_HEADER),
+            "devices": False,
+            "catalog": True,
+        }
+    patrol = is_patrol_cron(user_message)
+    return {"notify": patrol, "devices": patrol, "catalog": patrol}
+
+
+def _preinject_max_tokens() -> int:
+    """读 ``prompt.preinject_max_tokens``：环境变量 ``MILOCO_PROMPT__PREINJECT_MAX_TOKENS``
+    优先（对齐 TS 端 env 覆盖），其次 config.json，缺失 / 非法回默认 4000。"""
+    env = os.environ.get("MILOCO_PROMPT__PREINJECT_MAX_TOKENS", "").strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    try:
+        v = (load_shared_config().get("prompt") or {}).get("preinject_max_tokens")
+        return int(v) if v is not None else DEFAULT_PREINJECT_MAX_TOKENS
+    except (TypeError, ValueError):
+        return DEFAULT_PREINJECT_MAX_TOKENS
+
+
+# 预载正文用四个反引号围栏：skill 正文自身含 ``` 代码块，三反引号会被内层提前闭合。
+_BODY_FENCE = "````"
+
+
+def _fence_body(body: str) -> str:
+    return f"{_BODY_FENCE}markdown\n{body}\n{_BODY_FENCE}"
+
+
+def _build_preloaded_notify_block(max_tokens: int) -> str:
+    """notify skill 全文预载块；超预算 / 读不到返回空串，保留 B_NOTIFY 指针形态。"""
+    if max_tokens <= 0:
+        return ""
+    body = load_skill_body(NOTIFY_SKILL)
+    if not body:
+        return ""
+    tokens = estimate_tokens(body)
+    if tokens > max_tokens:
+        logger.warning(
+            "miloco-notify 正文约 %d tokens，超过 prompt.preinject_max_tokens=%d，回退为指针形态",
+            tokens, max_tokens,
+        )
+        return ""
+    return (
+        "## 通知技能（已预载）\n"
+        f"下面是 `{NOTIFY_SKILL}` skill 的完整正文，**已预载，勿再加载**——上方“通知用户”段要求先读的 skill 就是它，"
+        "读完本段即算满足该前置，不要再调用 skill 加载器或去读 SKILL.md；直接按其中的工作流决策并交付。\n"
+        f"{_fence_body(body)}"
+    )
+
+
+def _build_devices_excerpt_block(max_tokens: int) -> str:
+    """devices skill 节选预载块：只覆盖定位音箱 / 发 TTS / 简单控制；复杂控制仍读完整 skill。"""
+    if max_tokens <= 0:
+        return ""
+    body = load_skill_body(DEVICES_SKILL, sections=DEVICES_EXCERPT_SECTIONS)
+    if not body:
+        return ""
+    tokens = estimate_tokens(body)
+    if tokens > max_tokens:
+        logger.warning(
+            "miloco-devices 节选约 %d tokens，超过 prompt.preinject_max_tokens=%d，本轮不预载",
+            tokens, max_tokens,
+        )
+        return ""
+    return (
+        "## 设备技能节选（已预载）\n"
+        f"下面是 `{DEVICES_SKILL}` skill 中与“定位设备 → 生成命令 → 安全分流”及音箱 TTS 相关的节选，**已预载，勿再加载**："
+        '发 TTS（`device action <did> play-text "<文案>"`）或做一次简单控制 / 查询时直接照此执行，'
+        "命令形态、`play-text` 与 `execute-text-directive` 的取舍、安全设备二次确认均以此为准。"
+        f"涉及多台批量、相对调节、厨房电器、场景触发等节选未覆盖的操作时，再加载完整 `{DEVICES_SKILL}` skill。\n"
+        f"{_fence_body(body)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +455,25 @@ B_LANGUAGE = "## 输出语言\n用用户使用的语言回复用户（设备名�
 # ---------------------------------------------------------------------------
 
 DEVICE_CATALOG_INTRO = """## 设备目录
-下方 `# devices catalog` 是预注入的高频设备子集（≤50 台，非全量），字段规则见下方目录头部的注释。它**只用于快速拿到已点名单台设备的 did / spec_name**，不是全屋设备的全集。凡涉及设备**集合 / 多台 / 不确定数量**（无论查询还是控制），或目录里找不到目标，**必须先 `device list` 拉全量**再逐台处理，别拿子集当全部。
-**任何 `device control / props / action` 或 `scene` 命令前（含查询），必须先读 `miloco-devices` skill**——命令选择、集合判定、安全确认、补 on、错误处理等都在其中，别只凭本目录裸发。"""
+下方 `# devices catalog` 是预注入的高频设备子集（≤50 台，非全量），字段规则见下方目录头部的注释。它**只用于快速拿到已点名单台设备的 did / spec_name**，不是全屋设备的全集。凡涉及设备**集合 / 多台 / 不确定数量**（无论查询还是控制），或目录里找不到目标，**必须先 `device list` 拉全量**再逐台处理，别拿子集当全部。"""
+
+# 目录段第二段按是否已预载 devices 节选二选一（与 TS 端 buildCatalogBlock 一致）。
+DEVICE_CATALOG_SKILL_POINTER = (
+    "**任何 `device control / props / action` 或 `scene` 命令前（含查询），必须先读 `miloco-devices` skill**"
+    "——命令选择、集合判定、安全确认、补 on、错误处理等都在其中，别只凭本目录裸发。"
+)
+DEVICE_CATALOG_EXCERPT_POINTER = (
+    "下发 `device control / props / action` 前先按上方“设备技能节选（已预载）”的命令形态与安全分流执行，"
+    "别只凭本目录裸发；节选未覆盖的复杂控制或 `scene` 命令再读完整 `miloco-devices` skill。"
+)
+
+
+def _build_catalog_block(catalog: str, devices_preloaded: bool) -> str:
+    pointer = DEVICE_CATALOG_EXCERPT_POINTER if devices_preloaded else DEVICE_CATALOG_SKILL_POINTER
+    # 套 ```text 围栏：catalog 是类 TSV 数据块，行首 `#` 是注释前缀而非
+    # markdown 标题，裸贴会让 `# devices catalog` 在 `## 设备目录`(H2) 下
+    # 被解析成 H1 倒挂。
+    return f"{DEVICE_CATALOG_INTRO}\n{pointer}\n\n```text\n{catalog}\n```"
 
 
 def _home_profile_path() -> Path:
@@ -364,8 +623,12 @@ def build_pending_suggestion_block() -> str:
 # 装配
 # ---------------------------------------------------------------------------
 
-def _build_prepend(profile: Profile) -> str:
-    """指令块，按 prompt.ts §3 序。"""
+def _build_prepend(profile: Profile, user_message: str = "") -> str:
+    """指令块，按 prompt.ts §3 序。预载的 skill 正文是静态文本，紧随 B_NOTIFY 放在指令块里；
+    易变数据一律留在 ``_build_append``。"""
+    pre = resolve_preinject(profile, user_message)
+    max_tokens = _preinject_max_tokens()
+
     parts: List[str] = [B_IDENTITY, _build_timezone_block()]
     if profile == "full":
         parts.append(B_CAPABILITIES)
@@ -378,31 +641,49 @@ def _build_prepend(profile: Profile) -> str:
     if B_CONSTRAINTS:
         parts.append(B_CONSTRAINTS)
     parts.append(B_NOTIFY)
+    notify_block = _build_preloaded_notify_block(max_tokens) if pre["notify"] else ""
+    if notify_block:
+        parts.append(notify_block)
+    devices_block = _build_devices_excerpt_block(max_tokens) if pre["devices"] else ""
+    if devices_block:
+        parts.append(devices_block)
     parts.append(B_LANGUAGE)
-    return "\n\n".join(parts)
+    text = "\n\n".join(parts)
+    logger.debug(
+        "context_injection profile=%s prepend≈%d tokens（notify 预载 %d，devices 节选 %d）",
+        profile, estimate_tokens(text),
+        estimate_tokens(notify_block) if notify_block else 0,
+        estimate_tokens(devices_block) if devices_block else 0,
+    )
+    return text
 
 
-def _build_append(profile: Profile) -> str:
-    """数据块（档案 → 待回应 → 目录），minimal 不带。"""
-    if profile == "minimal":
-        return ""
+def _devices_preloaded(profile: Profile, user_message: str) -> bool:
+    """``_build_append`` 用：本轮是否真的预载了 devices 节选（与 ``_build_prepend`` 同判据，读缓存）。"""
+    if not resolve_preinject(profile, user_message)["devices"]:
+        return False
+    return bool(_build_devices_excerpt_block(_preinject_max_tokens()))
+
+
+def _build_append(profile: Profile, user_message: str = "") -> str:
+    """数据块（档案 → 待回应 → 目录）；minimal 只在巡检 cron 时带目录。"""
+    pre = resolve_preinject(profile, user_message)
     parts: List[str] = []
 
-    profile_block = build_home_profile_block()
-    if profile_block:
-        parts.append(profile_block)
+    if profile != "minimal":
+        profile_block = build_home_profile_block()
+        if profile_block:
+            parts.append(profile_block)
 
-    if profile == "full":
-        pending = build_pending_suggestion_block()
-        if pending:
-            parts.append(pending)
+        if profile == "full":
+            pending = build_pending_suggestion_block()
+            if pending:
+                parts.append(pending)
 
-    catalog = get_catalog()
-    if catalog:
-        # 套 ```text 围栏：catalog 是类 TSV 数据块，行首 `#` 是注释前缀而非
-        # markdown 标题，裸贴会让 `# devices catalog` 在 `## 设备目录`(H2) 下
-        # 被解析成 H1 倒挂。
-        parts.append(f"{DEVICE_CATALOG_INTRO}\n\n```text\n{catalog}\n```")
+    if pre["catalog"]:
+        catalog = get_catalog()
+        if catalog:
+            parts.append(_build_catalog_block(catalog, _devices_preloaded(profile, user_message)))
 
     return "\n\n".join(parts)
 
@@ -424,8 +705,8 @@ def inject_context(
     """
     try:
         profile = resolve_profile(session_id, platform, user_message)
-        prepend = _build_prepend(profile)
-        append = _build_append(profile)
+        prepend = _build_prepend(profile, user_message)
+        append = _build_append(profile, user_message)
 
         sections = [prepend] if prepend else []
         if append:

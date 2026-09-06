@@ -6,7 +6,18 @@ import {
   readOnboardingState,
   writeOnboardingInviteState,
 } from "../src/home-profile/onboarding_state.js";
-import { registerBeforePromptBuildHook, resolveProfile } from "../src/hooks/prompt.js";
+import {
+  isPatrolCron,
+  registerBeforePromptBuildHook,
+  resolvePreinject,
+  resolveProfile,
+} from "../src/hooks/prompt.js";
+import {
+  _resetSkillCache,
+  _setSkillsDirOverride,
+  estimateTokens,
+  loadSkillBody,
+} from "../src/services/skills.js";
 import { toLocalParts } from "../src/utils/time.js";
 
 // 感知日志文件名日期取部署时区；测试固定 tz 后按同一逻辑算出某个偏移日的文件名。
@@ -106,6 +117,7 @@ describe("before_prompt_build 组装", () => {
     );
     getCatalog.mockReset();
     getCatalog.mockResolvedValue("");
+    _resetSkillCache();
   });
 
   afterEach(() => {
@@ -113,6 +125,7 @@ describe("before_prompt_build 组装", () => {
     else process.env.MILOCO_HOME = prevHome;
     if (prevTz === undefined) delete process.env.MILOCO_TIMEZONE;
     else process.env.MILOCO_TIMEZONE = prevTz;
+    _setSkillsDirOverride(undefined);
     rmSync(tmpHome, { recursive: true, force: true });
     rmSync(tmpWorkspace, { recursive: true, force: true });
   });
@@ -406,5 +419,261 @@ describe("before_prompt_build 组装", () => {
 
     expect(r.appendSystemContext ?? "").not.toContain("Onboarding 会话收敛");
     expect(readOnboardingState()?.lockedSessionKey).toBe("telegram:s2");
+  });
+});
+
+// ===== 按 profile 预注入 skill 正文 =====
+
+const NOTIFY_PRELOADED = "## 通知技能（已预载）";
+const DEVICES_PRELOADED = "## 设备技能节选（已预载）";
+const ALREADY_LOADED = "已预载，勿再加载";
+// notify 正文里独有的句子，用来确认预载的是 skill 原文而非 TS 里复写的摘要
+const NOTIFY_BODY_MARK = "解析 → 分级 → 选人 → 选渠道 → 写文案 → 交付执行";
+const PATROL_PROMPT =
+  "[cron:job2 miloco-home-patrol] 执行家庭巡检。加载 miloco-home-patrol skill 进行巡检。";
+const DIGEST_PROMPT = "[cron:job1 miloco-perception-digest] 执行感知日志摘要。";
+
+describe("resolvePreinject", () => {
+  it("rule / suggestion 预载 notify + devices；full 仅在感知 header 下预载 notify", () => {
+    expect(resolvePreinject("rule", "任意")).toEqual({ notify: true, devices: true, catalog: true });
+    expect(resolvePreinject("suggestion", undefined)).toEqual({
+      notify: true,
+      devices: true,
+      catalog: true,
+    });
+    expect(resolvePreinject("full", "帮我关灯")).toEqual({
+      notify: false,
+      devices: false,
+      catalog: true,
+    });
+    expect(resolvePreinject("full", "[感知引擎]语音提醒：\n时间：10:00:00")).toEqual({
+      notify: true,
+      devices: false,
+      catalog: true,
+    });
+  });
+
+  it("minimal 只有巡检 cron 预载（含 catalog），其余 cron 全不带", () => {
+    expect(isPatrolCron(PATROL_PROMPT)).toBe(true);
+    expect(isPatrolCron(DIGEST_PROMPT)).toBe(false);
+    expect(resolvePreinject("minimal", PATROL_PROMPT)).toEqual({
+      notify: true,
+      devices: true,
+      catalog: true,
+    });
+    expect(resolvePreinject("minimal", DIGEST_PROMPT)).toEqual({
+      notify: false,
+      devices: false,
+      catalog: false,
+    });
+  });
+});
+
+describe("before_prompt_build 预注入", () => {
+  let tmpHome: string;
+  const prevHome = process.env.MILOCO_HOME;
+  const prevCap = process.env.MILOCO_PROMPT__PREINJECT_MAX_TOKENS;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(path.join(tmpdir(), "miloco-prompt-pre-"));
+    process.env.MILOCO_HOME = tmpHome;
+    delete process.env.MILOCO_PROMPT__PREINJECT_MAX_TOKENS;
+    getCatalog.mockReset();
+    getCatalog.mockResolvedValue("");
+    _resetSkillCache();
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.MILOCO_HOME;
+    else process.env.MILOCO_HOME = prevHome;
+    if (prevCap === undefined) delete process.env.MILOCO_PROMPT__PREINJECT_MAX_TOKENS;
+    else process.env.MILOCO_PROMPT__PREINJECT_MAX_TOKENS = prevCap;
+    _setSkillsDirOverride(undefined);
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it.each(["agent:main:miloco-rule", "agent:main:miloco-suggest"])(
+    "%s：prepend 含 notify 全文 + devices 节选 + “已预载，勿再加载”",
+    async (key) => {
+      const { api, run } = makeApi();
+      registerBeforePromptBuildHook(api, {} as any);
+      const r = await run(key);
+      const p = r.prependSystemContext;
+      expect(p).toContain(NOTIFY_PRELOADED);
+      expect(p).toContain(NOTIFY_BODY_MARK);
+      expect(p).toContain(ALREADY_LOADED);
+      expect(p).toContain(DEVICES_PRELOADED);
+      // 节选只含定位 / 生成命令 / 安全分流 / 音箱 TTS 这几节
+      expect(p).toContain("步骤 2 · 确定设备列表");
+      expect(p).toContain("步骤 4 · 生成指令");
+      expect(p).toContain("步骤 5 · 安全分流");
+      expect(p).toContain("`play-text` vs `execute-text-directive`");
+      expect(p).not.toContain("步骤 1 · 命令拆分");
+      expect(p).not.toContain("再 `start-cook` 启动");
+      // 预载正文是 skill 原文：frontmatter 已剥、身份不变量沿用
+      expect(p).not.toContain("name: miloco-notify");
+      expect(p).not.toMatch(/^你是(?!否)/m);
+    },
+  );
+
+  it("full 无感知 header → 保持指针形态，不预载", async () => {
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+    const r = await run("agent:main:miloco", { prompt: "帮我把空调关了" });
+    expect(r.prependSystemContext).toContain("miloco-notify");
+    expect(r.prependSystemContext).not.toContain(NOTIFY_PRELOADED);
+    expect(r.prependSystemContext).not.toContain(DEVICES_PRELOADED);
+  });
+
+  it("full 正文以 [感知引擎] 开头 → 预载 notify（不预载 devices 节选）", async () => {
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+    const r = await run("agent:main:miloco", {
+      prompt: "[感知引擎]语音提醒：\n时间：10:00:00\n来源：客厅的音箱(did=1)\n说话人：爸爸\n语音指令：提醒我半小时后关火",
+    });
+    expect(r.prependSystemContext).toContain(NOTIFY_PRELOADED);
+    expect(r.prependSystemContext).toContain(NOTIFY_BODY_MARK);
+    expect(r.prependSystemContext).not.toContain(DEVICES_PRELOADED);
+  });
+
+  it("巡检 cron → notify + devices 节选 + catalog；digest cron 保持 minimal", async () => {
+    getCatalog.mockResolvedValue("# devices catalog\n# 数据格式\n...");
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+
+    const patrol = await run("agent:main:miloco", { prompt: PATROL_PROMPT });
+    expect(patrol.prependSystemContext).toContain(NOTIFY_PRELOADED);
+    expect(patrol.prependSystemContext).toContain(DEVICES_PRELOADED);
+    expect(patrol.appendSystemContext).toContain("## 设备目录");
+    expect(patrol.appendSystemContext).toContain("# devices catalog");
+    // 其余 minimal 特征不变：无感知 / 能力 / 记忆块
+    expect(patrol.prependSystemContext).not.toContain("## 感知");
+    expect(patrol.prependSystemContext).not.toContain("## 能力概览");
+    expect(patrol.prependSystemContext).not.toContain("## 家庭记忆");
+
+    const digest = await run("agent:main:miloco", { prompt: DIGEST_PROMPT });
+    expect(digest.prependSystemContext).not.toContain(NOTIFY_PRELOADED);
+    expect(digest.prependSystemContext).not.toContain(DEVICES_PRELOADED);
+    expect(digest.appendSystemContext).toBeUndefined();
+  });
+
+  it("notify 正文超 prompt.preinject_max_tokens → 回退指针形态；<=0 关闭预注入", async () => {
+    writeFileSync(
+      path.join(tmpHome, "config.json"),
+      JSON.stringify({ prompt: { preinject_max_tokens: 100 } }),
+    );
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+    const r = await run("agent:main:miloco-rule");
+    expect(r.prependSystemContext).toContain("miloco-notify");
+    expect(r.prependSystemContext).not.toContain(NOTIFY_PRELOADED);
+    expect(r.prependSystemContext).not.toContain(DEVICES_PRELOADED);
+
+    writeFileSync(
+      path.join(tmpHome, "config.json"),
+      JSON.stringify({ prompt: { preinject_max_tokens: 0 } }),
+    );
+    const off = await run("agent:main:miloco-rule");
+    expect(off.prependSystemContext).not.toContain(NOTIFY_PRELOADED);
+    expect(off.prependSystemContext).not.toContain(DEVICES_PRELOADED);
+  });
+
+  it("MILOCO_PROMPT__PREINJECT_MAX_TOKENS 环境变量优先于 config.json", async () => {
+    writeFileSync(
+      path.join(tmpHome, "config.json"),
+      JSON.stringify({ prompt: { preinject_max_tokens: 100000 } }),
+    );
+    process.env.MILOCO_PROMPT__PREINJECT_MAX_TOKENS = "50";
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+    const r = await run("agent:main:miloco-rule");
+    expect(r.prependSystemContext).not.toContain(NOTIFY_PRELOADED);
+  });
+
+  it("skill 文件缺失 → 不抛、回退指针形态", async () => {
+    const emptySkills = mkdtempSync(path.join(tmpdir(), "miloco-noskills-"));
+    try {
+      _setSkillsDirOverride(emptySkills);
+      const { api, run } = makeApi();
+      registerBeforePromptBuildHook(api, {} as any);
+      const r = await run("agent:main:miloco-rule");
+      expect(r.prependSystemContext).toContain("miloco-notify");
+      expect(r.prependSystemContext).not.toContain(NOTIFY_PRELOADED);
+      expect(r.prependSystemContext).not.toContain(DEVICES_PRELOADED);
+    } finally {
+      rmSync(emptySkills, { recursive: true, force: true });
+    }
+  });
+
+  it("顺序：预载块在 prepend 紧随“通知用户”、位于“输出语言”前；catalog 仍是 append 末尾", async () => {
+    getCatalog.mockResolvedValue("# devices catalog\n# 数据格式\n...");
+    const ws = mkdtempSync(path.join(tmpdir(), "miloco-ws-order-"));
+    try {
+      writePerception(
+        perceptionFile(ws, "Asia/Shanghai"),
+        "# 2026-01-01 感知记忆\n\n- 09:00 书房 · 有人在工作",
+      );
+      const { api, run } = makeApi();
+      registerBeforePromptBuildHook(api, {} as any);
+      const r = await run("agent:main:miloco-rule", { workspaceDir: ws });
+      const p = r.prependSystemContext;
+      const iNotify = p.indexOf("## 通知用户");
+      const iPre = p.indexOf(NOTIFY_PRELOADED);
+      const iDev = p.indexOf(DEVICES_PRELOADED);
+      const iLang = p.indexOf("## 输出语言");
+      expect(iNotify).toBeGreaterThan(-1);
+      expect(iNotify).toBeLessThan(iPre);
+      expect(iPre).toBeLessThan(iDev);
+      expect(iDev).toBeLessThan(iLang);
+      // 预载正文不进 append；catalog 在 append 末尾
+      const a = r.appendSystemContext ?? "";
+      expect(a).not.toContain(NOTIFY_PRELOADED);
+      expect(a.indexOf("## 今日感知日志")).toBeLessThan(a.indexOf("## 设备目录"));
+      expect(a.trimEnd().endsWith("```")).toBe(true);
+      // 目录段指向上方节选，而不再要求先读完整 devices skill
+      expect(a).toContain("设备技能节选（已预载）");
+      expect(a).not.toContain("必须先读 `miloco-devices` skill");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("未预载 devices 时目录段保留“必须先读 miloco-devices skill”硬前置", async () => {
+    getCatalog.mockResolvedValue("# devices catalog\n...");
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+    const r = await run("agent:main:miloco");
+    expect(r.appendSystemContext).toContain("必须先读 `miloco-devices` skill");
+  });
+
+  // 默认预算若小于 notify 正文，预注入会静默失效（每轮 warn 但没人看）。钉住：skill 长了要
+  // 么精简正文、要么同步抬高默认值。
+  it("notify 正文估算不超过默认预算 4000 tokens", () => {
+    const tokens = estimateTokens(loadSkillBody("miloco-notify"));
+    expect(tokens).toBeGreaterThan(0);
+    expect(tokens).toBeLessThanOrEqual(4000);
+  });
+
+  it("各 profile 的 prepend 估算规模（记录用）", async () => {
+    getCatalog.mockResolvedValue("");
+    const { api, run } = makeApi();
+    registerBeforePromptBuildHook(api, {} as any);
+    const cases: Array<[string, string | undefined, string]> = [
+      ["full", undefined, "agent:main:miloco"],
+      ["full+感知", "[感知引擎]语音提醒：x", "agent:main:miloco"],
+      ["rule", undefined, "agent:main:miloco-rule"],
+      ["suggestion", undefined, "agent:main:miloco-suggest"],
+      ["minimal(digest)", DIGEST_PROMPT, "agent:main:miloco"],
+      ["minimal(patrol)", PATROL_PROMPT, "agent:main:miloco"],
+    ];
+    const sizes: Record<string, number> = {};
+    for (const [label, prompt, key] of cases) {
+      const r = await run(key, { prompt });
+      sizes[label] = estimateTokens(r.prependSystemContext);
+      expect(sizes[label]).toBeGreaterThan(0);
+    }
+    console.log(`prepend tokens by profile: ${JSON.stringify(sizes)}`);
+    expect(sizes.rule).toBeGreaterThan(sizes.full);
+    expect(sizes["minimal(digest)"]).toBeLessThan(sizes["minimal(patrol)"]);
   });
 });

@@ -48,6 +48,11 @@ _DEFAULTS: Dict[str, Any] = {
             "api_key": "",
         }
     },
+    # 系统上下文装配参数：仅 agent 插件消费，与 openclaw 插件 SHARED_CONFIG_SCHEMA.prompt 同键。
+    "prompt": {
+        # 按 profile 预注入单个 skill 正文的 token 上限（估算）；超限回退为“先读 skill”指针；<=0 关闭
+        "preinject_max_tokens": 4000,
+    },
 }
 
 
