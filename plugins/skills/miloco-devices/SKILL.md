@@ -3,8 +3,8 @@ name: miloco-devices
 description: 查询与控制米家智能家居设备。查询能力包括设备开关状态、运行状态、电量、设定温度、当前温湿度、PM2.5 等环境与设备数据；控制能力包括开关灯、调节空调温度/模式/风速、控制窗帘开合、启动或停止扫地机器人、开关摄像头等设备操作；场景能力包括触发已有米家场景，如回家、离家、睡眠等智能场景；以及刷新设备列表缓存。
 metadata:
   author: miloco
-  version: "1.7"
-  date: "2026-06-14"
+  version: "1.8"
+  date: "2026-09-07"
   openclaw:
     requires:
       bins: ["miloco-cli"]
@@ -107,22 +107,27 @@ miloco-cli device control 4962 --set target-temperature 26 --set on@空调 true
 
 先 `device props` 取当前值 → 步进（亮度±10/色温±500/温度±1）→ 确保在 `[min,max;step]` 范围内。这是**先查后改**，必须**单独一轮**（要先拿到当前值，不能串进同一条）。
 
-### 步骤 5 · 安全分流
+### 步骤 5 · 安全分流（服务端强制）
 
-本步只**分流、不下发**：把步骤 4 生成的命令按是否安全分成**普通批 / 危险批**，交给步骤 6 的下发回合。
+**危险设备的二次确认由服务端强制执行，不靠你自觉。** 门锁 / 摄像头 / 可视门铃 / 燃气 / 烟感等受保护类别（配置 `safety.protected_categories`）的 control / action 发到服务端后**不会执行**，而是被 **stage**（暂存）：返回体 `staged=true`，带 `change_id`、`summary`、`confirm_token`、`next`。只有用户明确同意后，你执行 `device apply <change_id> --token <confirm_token>`，服务端才真正下发；用户拒绝则 `device discard <change_id>`。
 
-- **危险批**：**门锁 / 摄像头 / 燃气阀 / 烟雾报警器** 等安全设备的控制 / 动作（断电、开关机、开锁、关阀）——需二次确认。
+本步你只需**分流、不下发**：把步骤 4 生成的命令分成**普通批 / 危险批**，交给步骤 6 的下发回合。
+
+- **危险批**：上述受保护类别设备的控制 / 动作（开锁、关摄像头、关阀……）——照常下发，但预期它会被服务端 stage。
 - **普通批**：其余设备的 control / action，以及**所有设备的 props 查询**。
 - 没有危险指令 → 全部归普通批，下发回合只跑第 1 轮。
+- 拿不准是否受保护 → 直接下发即可，服务端会替你判断；返回 `staged` 就按危险批流程走。
 
 ### 步骤 6 · 下发和回复
 
 一个「回合」=**下发（6.1）→ 回复（6.2）**。按步骤 5 的分流结果，最多跑两轮：
 
-1. **第 1 轮 · 普通批**：下发后**回复时附上所有危险指令的二次确认**，让用户确认。
-2. **第 2 轮 · 危险批**：仅把用户同意的危险指令再下发一遍；未同意的跳过。无危险指令则只有第 1 轮。
+1. **第 1 轮 · 全部下发**：普通批直接生效；危险批返回 `staged`。**回复时把每条 staged 的 `summary` 复述给用户征求确认**（“确定要关闭客厅摄像头吗？”），并记住对应的 `change_id` 与 `confirm_token`。
+2. **第 2 轮 · apply / discard**：用户同意的 → `miloco-cli device apply <change_id> --token <confirm_token>`；用户拒绝或不表态的 → `miloco-cli device discard <change_id>`。**禁止**在用户未明确同意时 apply。待确认变更 10 分钟过期（`safety.stage_ttl_sec`），过期后需重新下发。
 
-> "关客厅灯，顺便关摄像头" → 先把客厅灯关掉、回复"灯已关闭，确定要关闭摄像头吗？"（第 1 轮：普通批下发 + 危险确认）；用户确认后才 `device control` 关摄像头（第 2 轮）。
+> "关客厅灯，顺便关摄像头" → 一轮把两条都发出去：灯直接关闭、摄像头返回 `staged`；回复“灯已关闭，确定要关闭摄像头吗？”；用户说“确定”后 `device apply chg-0001 --token …`（第 2 轮）。
+
+> **凭据说明**：`confirm_token` 当前随 CLI 输出一并返回（CLI 是唯一用户面）；它是给**用户**的确认凭据，你只是代为转达执行——后续版本会把凭据改投 IM / 面板、不再经过你。
 
 **6.1 下发**
 
@@ -178,8 +183,11 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 | 设备未找到 | `device refresh` → 重试一次 | "没找到，正在刷新…" |
 | 设备离线 | **照常下命令**，CLI 返回体 `results[]`/`result` 的 `code_msg` 会标"设备离线" | "{设备名}离线了" |
 | 设备侧执行失败 | 看返回体 `results[]`/`result` 的 `code_msg` 中文原因（属性不可写 / 属性不存在 / 属性值不正确等）→ 据此回复或改对重发 | "{设备名}该属性不可写" |
-| 参数越界 | CLI 报 `out of range [min,max;step] <unit>` → 按范围改对 | "亮度范围1-100" |
-| 枚举值非法 | CLI 报 `not a valid enum; allowed: …` → 从列出的可选值里挑对的重发 | "风速可选 自动/1-8 档" |
+| 参数越界 | CLI 或服务端报 `out of range [min,max;step] <unit>` → 按范围改对（服务端校验是最终裁定，CLI 只是提前拦截） | "亮度范围1-100" |
+| 枚举值非法 | CLI 或服务端报 `not a valid enum; allowed: …` → 从列出的可选值里挑对的重发 | "风速可选 自动/1-8 档" |
+| 属性只读 / iid 不在 spec | 服务端报 `read-only` / `not in device spec` → 重新 `device spec` 核对 | "该属性不可控制" |
+| 返回 `staged=true` | 受保护设备，服务端未执行 → 复述 `summary` 征求确认 → 同意 `device apply <change_id> --token <token>` / 拒绝 `device discard <change_id>` | "确定要关闭摄像头吗？" |
+| apply 报 token 不匹配 / 已过期 | 不要猜 token；过期则重新下发原命令拿新的 change_id 再确认 | "确认已过期，我重新发起一次" |
 | 多设备同名 | 列候选追问 | "找到2个，哪个？" |
 | spec_name 多匹配 | CLI 报 "matches N iids" → 按建议重发 | （自动处理） |
 | 用 control 调 action | CLI 报 "is an action… 请改用 device action" → 切 `device action` | （自动处理） |
@@ -188,7 +196,7 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 ## 关键规则
 
 1. **`spec_name` / action `iid` 不硬编码**——以 catalog / `device spec` 为准（`@` 后缀、`play-text` 等因设备而异）。
-2. **安全设备控制必须二次确认**——门锁/摄像头/燃气阀/烟雾报警器（步骤5）。
+2. **安全设备控制由服务端 stage、用户确认后才 apply**——门锁/摄像头/可视门铃/燃气/烟感（步骤 5/6）；未获用户明确同意**禁止** `device apply`。
 3. **控制非 on 属性强制补该设备实际开关 spec_name**（并入同一条 `--set`，可能 `on@空调`，非字面 `on`）——不查不分轮（步骤4）。
 4. **离线设备照常下命令**——由 CLI 兜底。
 
@@ -197,7 +205,7 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 - ❌ 不支持非米家生态设备 / 第三方 API / 绕过安全规范的指令
 - ❌ 禁止编造 did / spec_name / model
 - ⚠️ 单次 ≤10 个设备，超出自动拆分
-- ✅ 支持 `scene trigger` 触发已有场景、`device refresh` 刷新缓存
+- ✅ 支持 `scene trigger` 触发已有场景、`device refresh` 刷新缓存、`device changes` 查看待确认变更
 
 ## 示例
 

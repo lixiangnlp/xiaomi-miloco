@@ -253,6 +253,28 @@ class NotifySettings(BaseModel):
     # settings 加载（后端起不来），对一个可选兜底旋钮是过度约束。
 
 
+class SafetySettings(BaseModel):
+    """设备控制安全闸门（服务端强制，见 ``miot/gate.py``）。
+
+    命中 ``protected_categories`` 的设备，agent 发起的控制 / 动作不会直接执行，而是
+    stage 到待确认表，等用户确认后经 ``POST /api/miot/changes/{id}/apply`` 才下发；
+    规则引擎的静态动作命中时直接拒绝（无人可确认）。类别名取设备 urn 的第 4 段
+    （``urn:miot-spec-v2:device:{category}:…``），与 ``device list`` 的 category 列一致。
+    """
+
+    protected_categories: list[str] = Field(
+        default=["lock", "camera", "video-doorbell", "gas-sensor", "smoke-sensor"],
+        description=(
+            "需要用户二次确认才能控制的设备类别（MIoT spec 类别名）；"
+            "空列表 = 关闭闸门（不推荐）"
+        ),
+    )
+    stage_ttl_sec: float = Field(
+        default=600.0,
+        description="待确认变更的有效期（秒），过期后需重新发起；最小 1 秒",
+    )
+
+
 class SchedulerSettings(BaseModel):
     """miloco 内置定时任务自动管理开关。
 
@@ -645,6 +667,10 @@ class MilocoSettings(BaseSettings):
     notify: NotifySettings = Field(
         default_factory=NotifySettings,
         description="通知发送运行参数（去重窗口等）",
+    )
+    safety: SafetySettings = Field(
+        default_factory=SafetySettings,
+        description="设备控制安全闸门（受保护类别 / 待确认变更有效期）",
     )
     scheduler: SchedulerSettings = Field(
         default_factory=SchedulerSettings,

@@ -218,6 +218,14 @@ class DeviceControlRequest(BaseModel):
     params: list[Any] | None = Field(None, description="Input params for call_action")
 
 
+class ApplyChangeRequest(BaseModel):
+    """确认并下发一条已 stage 的受保护设备变更。"""
+
+    confirm_token: str = Field(
+        ..., min_length=1, description="stage 时服务端签发给用户的一次性确认凭据"
+    )
+
+
 class SendNotifyRequest(BaseModel):
     notify: str = Field(..., description="Notification text", min_length=1)
 

@@ -59,6 +59,13 @@ miot:
 notify:
   dedup_window_sec: 60   # 相同通知文案在此窗口(秒)内只发一次；<=0 关闭去重
 
+# 设备控制安全闸门（服务端强制，miot/gate.py）
+# 命中 protected_categories 的设备：agent 控制 → 先 stage、用户确认后 apply；规则静态动作 → 拒绝。
+# 类别名 = 设备 urn 第 4 段（与 `miloco-cli device list` 的 category 列一致）。
+safety:
+  protected_categories: ["lock", "camera", "video-doorbell", "gas-sensor", "smoke-sensor"]
+  stage_ttl_sec: 600     # 待确认变更有效期（秒）
+
 # 摄像头采集参数
 camera:
   frame_interval: 1000   # 帧采集间隔（毫秒）

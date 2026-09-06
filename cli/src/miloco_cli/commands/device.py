@@ -1,4 +1,4 @@
-"""device 命令组：list / spec / catalog / control / props / action / refresh。"""
+"""device 命令组：list / spec / catalog / control / props / action / refresh / changes / apply / discard。"""
 
 import json
 import sys
@@ -105,9 +105,41 @@ def _annotate_result_codes(data: dict) -> None:
         data["message"] = f"部分失败（{len(failures)}/{total}）：{reasons}"
 
 
+def _print_if_staged(data: dict, did: str, pretty: bool) -> bool:
+    """服务端把受保护设备（门锁 / 摄像头 / 燃气 / 烟感…）的控制 **stage** 而未执行时，
+    输出给 agent 的提示并返回 True；否则返回 False 由调用方按普通结果处理。
+
+    confirm_token 是服务端签发的一次性确认凭据。当前阶段 CLI 是唯一用户面，凭据随
+    输出给到用户侧；后续 PR 会把凭据改投 IM / 面板，agent 不再可见。
+    """
+    inner = data.get("data")
+    if not isinstance(inner, dict) or not inner.get("staged"):
+        return False
+    change_id = inner.get("change_id")
+    print_result(
+        {
+            "staged": True,
+            "change_id": change_id,
+            "did": did,
+            "device_name": inner.get("device_name"),
+            "category": inner.get("category"),
+            "summary": inner.get("summary"),
+            "expires_at": inner.get("expires_at"),
+            "confirm_token": inner.get("confirm_token"),
+            "next": (
+                "受保护设备，服务端未执行。向用户复述 summary 并征得同意；用户确认后执行 "
+                f"miloco-cli device apply {change_id} --token <confirm_token>；"
+                f"用户拒绝则 miloco-cli device discard {change_id}"
+            ),
+        },
+        pretty,
+    )
+    return True
+
+
 @click.group("device")
 def device_group():
-    """设备操作：列表 / 规格 / 目录 / 控制 / 状态 / 动作 / 刷新缓存。"""
+    """设备操作：列表 / 规格 / 目录 / 控制 / 状态 / 动作 / 刷新缓存 / 待确认变更。"""
 
 
 # ─── device list ─────────────────────────────────────────────────────────────
@@ -418,6 +450,8 @@ def _do_control(did: str, properties: list[dict], pretty: bool) -> None:
         body = {"type": "set_properties", "properties": resolved_properties}
 
     data = api_post(f"/api/miot/devices/{did}/control", body)
+    if _print_if_staged(data, did, pretty):
+        return
     # 后端返回体不含 did；并发批量控制（&+wait）时多行输出交错，补 did 让结果可归属
     if isinstance(data.get("data"), dict):
         data["data"]["did"] = did
@@ -512,8 +546,54 @@ def device_action(did, iid, params, pretty):
             "params": [infer_value(p) for p in params],
         },
     )
+    if _print_if_staged(data, did, pretty):
+        return
     # 后端返回体不含 did；并发批量 action（&+wait）时多行输出交错，补 did 让结果可归属
     if isinstance(data.get("data"), dict):
         data["data"]["did"] = did
     _annotate_result_codes(data)
     print_result(data, pretty)
+
+
+# ─── device changes / apply / discard ────────────────────────────────────────
+
+
+@device_group.command("changes")
+@click.option("--pretty", is_flag=True)
+def device_changes(pretty):
+    """列出受保护设备的待确认变更（服务端 stage、尚未 apply / discard / 过期）。"""
+    from miloco_cli.client import api_get
+
+    print_result(api_get("/api/miot/changes"), pretty)
+
+
+@device_group.command("apply")
+@click.argument("change_id")
+@click.option(
+    "--token",
+    "token",
+    required=True,
+    help="stage 时输出的 confirm_token（用户确认凭据，一次性）",
+)
+@click.option("--pretty", is_flag=True)
+def device_apply(change_id, token, pretty):
+    """用户确认后下发一条已 stage 的受保护设备变更。
+
+    只能在用户明确同意后调用。服务端会按当前配置重新校验（scope / 参数），
+    token 一次性，成功或失败后该 change_id 即失效。
+    """
+    from miloco_cli.client import api_post
+
+    data = api_post(f"/api/miot/changes/{change_id}/apply", {"confirm_token": token})
+    _annotate_result_codes(data)
+    print_result(data, pretty)
+
+
+@device_group.command("discard")
+@click.argument("change_id")
+@click.option("--pretty", is_flag=True)
+def device_discard(change_id, pretty):
+    """用户拒绝时丢弃一条已 stage 的变更。"""
+    from miloco_cli.client import api_delete
+
+    print_result(api_delete(f"/api/miot/changes/{change_id}"), pretty)
