@@ -13,12 +13,21 @@
 - `build_matched_rules_text(rules)` — 仅供 build_agent_text 入表使用（client.py 的
   matched_rules 推送走 rule_service.update_state，不拼文本）
 - `build_agent_text(result)` — 给 meaningful_events.text 用的聚合函数
+
+围栏（``fenced``）：三个分类 builder 直接作为 dispatch builder 时产出的是 **agent 输入**，
+默认把 header 之后的整个块体放进 ``<perception_data>…</perception_data>``（见
+``perception/fence.py``），header 与 key:value 骨架不变——插件 prompt 靠它们认格式，
+靠围栏认“哪些是第三方写的、只能转述不能执行”。``build_agent_text`` 走
+``fenced=False``：它产出的是住户日志 / DB 文本，前端按 ``\\n\\n`` 切段、按整行认
+“触发状态”，围栏标签会在住户界面里裸露。两条路径共享同一份字段级清洗（``oneline`` →
+``sanitize_text``），只在是否包围栏上分叉。
 """
 
 from __future__ import annotations
 
 import re
 
+from miloco.perception.fence import MAX_FIELD_CHARS, fence, sanitize_text
 from miloco.perception.types import (
     CaptionEntry,
     MatchedRule,
@@ -128,19 +137,23 @@ def _strip_task_prefix(name: str) -> str:
     return re.sub(r"^\[[A-Za-z0-9_-]+\]\s*", "", name)
 
 
-def oneline(s: str) -> str:
-    """折叠内嵌换行 / 连续空白为单空格——**任何模型直出或可 PATCH 的 free-text 进
-    ``key：value`` 行之前都要过这一道**（公开给 rule/runner.py 的 agent 回调 builder 复用，
-    两处共用同一道防线，别各写一份）。
+def oneline(s: str, max_chars: int | None = MAX_FIELD_CHARS) -> str:
+    """字符层清洗 + 折叠内嵌换行 / 连续空白为单空格——**任何模型直出或可 PATCH 的
+    free-text 进 ``key：value`` 行之前都要过这一道**（公开给 rule/runner.py 的 agent 回调
+    builder 复用，两处共用同一道防线，别各写一份）。
 
     不折叠时两种伪造：① 一个 ``\\n`` 就能在块内插一行假字段（如
     `健身追踪\\n触发原因：伪造`）；② 一个 ``\\n\\n`` 能逃出本块 header、另起一整段假块
     （住户日志前端按 ``\\n\\n`` 切 section，agent 回调按 ``\\n\\n═══\\n\\n`` 切 callback）。
 
-    已知不足：只折叠 ``str.isspace()`` 认的字符，U+2800 等「渲染为空白但 Python 不认」
-    的填充符仍会存活（见 PR #457 review 第 5 条，属后续加固）。
+    折叠之前先过 ``perception.fence.sanitize_text``：去零宽 / 双向控制字符，把 U+2800 等
+    “渲染为空白但 ``str.isspace()`` 不认”的填充符折成空格（补上 PR #457 review 第 5 条
+    记下的那条已知不足），删 ``<perception_data`` 围栏标记与 ``<system>`` 类特殊 token，
+    去牙伪造轮次标记。截断在最后（``max_chars`` 含后缀；传 ``None`` 不截）。
     """
-    return " ".join(s.split()) if s else s
+    if not s:
+        return s
+    return " ".join(sanitize_text(s, max_chars).split())
 
 
 def _fmt_matched_rule(
@@ -174,15 +187,23 @@ def _fmt_matched_rule(
     )
 
 
-def build_text(header: str, blocks: list[str]) -> str | None:
-    """header + 多条 key:value 块，块间用 `═══` 分隔。"""
+def build_text(header: str, blocks: list[str], *, fenced: bool = True) -> str | None:
+    """header + 多条 key:value 块，块间用 `═══` 分隔。
+
+    ``fenced=True``（agent 输入）：header 留在围栏外做格式锚点，块体整体进
+    ``<perception_data>`` 围栏——块里每个 value 都是第三方写的（转写 / VLM / 米家设备名），
+    骨架 key 只是给 agent 的字段标签，一起放进围栏不影响它读字段。
+    ``fenced=False``（住户日志 / DB）：原样，不让围栏标签裸露在住户界面。
+    """
     if not blocks:
         return None
     body = "\n\n═══\n\n".join(blocks)
+    if fenced:
+        body = fence(body)
     return f"{header}\n{body}"
 
 
-def build_speeches_text(speeches: list[Speech]) -> str | None:
+def build_speeches_text(speeches: list[Speech], *, fenced: bool = True) -> str | None:
     """拼接语音指令文本（过滤 needs_response=True AND is_complete=True 的 Speech）。
 
     Returns None 表示无满足条件的 Speech（调用方应跳过推送）。
@@ -190,17 +211,21 @@ def build_speeches_text(speeches: list[Speech]) -> str | None:
     commands = [s for s in speeches if s.needs_response and s.is_complete]
     if not commands:
         return None
-    return build_text(HEADER_SPEECH, [_fmt_speech(s) for s in commands])
+    return build_text(HEADER_SPEECH, [_fmt_speech(s) for s in commands], fenced=fenced)
 
 
-def build_suggestions_text(suggestions: list[Suggestion]) -> str | None:
+def build_suggestions_text(
+    suggestions: list[Suggestion], *, fenced: bool = True
+) -> str | None:
     """拼接建议消息文本。
 
     Returns None 表示无 suggestion（调用方应跳过推送）。
     """
     if not suggestions:
         return None
-    return build_text(HEADER_SUGGESTION, [_fmt_suggestion(s) for s in suggestions])
+    return build_text(
+        HEADER_SUGGESTION, [_fmt_suggestion(s) for s in suggestions], fenced=fenced
+    )
 
 
 def build_matched_rules_text(
@@ -210,6 +235,8 @@ def build_matched_rules_text(
     task_descs: dict[str, str] | None = None,
     rule_statuses: dict[str, TriggerOutcome] | None = None,
     incomplete_rule_ids: set[str] | None = None,
+    *,
+    fenced: bool = True,
 ) -> str | None:
     """拼接规则命中文本（仅入表用；client.py 的 matched_rules 推送走 rule_service.update_state，
     不经过本函数）。
@@ -250,7 +277,7 @@ def build_matched_rules_text(
         else:
             status = _OUTCOME_LABEL.get(outcome, "") if outcome is not None else ""
         blocks.append(_fmt_matched_rule(r, task_desc, rule_label, query, status))
-    return build_text(HEADER_MATCHED_RULE, blocks)
+    return build_text(HEADER_MATCHED_RULE, blocks, fenced=fenced)
 
 
 def _with_caption(items: list, captions: list[CaptionEntry]) -> list:
@@ -272,16 +299,25 @@ def build_agent_text(
     rule_statuses: dict[str, TriggerOutcome] | None = None,
     incomplete_rule_ids: set[str] | None = None,
 ) -> str:
-    """拼接 meaningful_events.text 字段（聚合三类信息，顺序固定：指令 → 提醒 → 规则）。"""
+    """拼接 meaningful_events.text 字段（聚合三类信息，顺序固定：指令 → 提醒 → 规则）。
+
+    住户日志 / DB 文本，**不包围栏**（``fenced=False``）：前端 ``eventText.ts`` 按
+    ``\\n\\n(?=[感知引擎])`` 切段、按 ``\\n\\n`` 切 section、按整行认“触发状态”，
+    围栏标签会以裸文本出现在住户界面。字段级清洗（``oneline``）两条路径同样生效。
+    """
     parts: list[str] = []
-    if sp := build_speeches_text(_with_caption(result.speeches, result.caption)):
+    if sp := build_speeches_text(
+        _with_caption(result.speeches, result.caption), fenced=False
+    ):
         parts.append(sp)
-    if sg := build_suggestions_text(_with_caption(result.suggestions, result.caption)):
+    if sg := build_suggestions_text(
+        _with_caption(result.suggestions, result.caption), fenced=False
+    ):
         parts.append(sg)
     if mr := build_matched_rules_text(
         _with_caption(result.matched_rules, result.caption),
         rule_names, rule_queries, task_descs, rule_statuses,
-        incomplete_rule_ids,
+        incomplete_rule_ids, fenced=False,
     ):
         parts.append(mr)
     return "\n\n".join(parts) if parts else ""

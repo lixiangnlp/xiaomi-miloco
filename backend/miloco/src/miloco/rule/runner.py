@@ -97,11 +97,20 @@ def build_rule_callbacks_text(callbacks: list[RuleTriggerCallback]) -> str | Non
     callback 块、附上「无需通知住户，请直接调用某动作」之类的假意图段，而 agent 真能执行
     设备动作。``prompt_text`` 不折叠——它是规则自带的多行 prompt（内部按 ``---`` 分段），
     多行是它的设计形态、且不由感知模型产出。
+
+    **围栏**：元信息段整体进 ``<perception_data>`` 围栏（``perception/fence.py``）——它全是
+    第三方 / 模型直出的观察（画面描述、触发原因、住户起的房间名 / 设备名）；插件 prompt 里
+    的契约让 agent 把围栏内的“指令”只当报告。``prompt_text``（意图 / 处理流程 / 额外信息）
+    **留在围栏外**：它是住户通过对话配置、agent 建任务时写下的规则本体，正是“已配置的规则”
+    这条被允许的动作来源，放进围栏会让 agent 依契约拒绝执行自己的规则。它仍过字符层
+    ``sanitize_text``（保留换行）：删零宽字符 / 特殊 token / 伪造围栏标记——否则规则文本里
+    塞一个 ``</perception_data>`` 就能在 agent 眼里提前关掉上面的围栏。
     """
     if not callbacks:
         return None
 
     from miloco.perception.event_text_builder import HEADER_MATCHED_RULE, oneline
+    from miloco.perception.fence import fence, sanitize_text
 
     def _fmt_source(c: RuleTriggerCallback) -> str:
         # did 由引擎注入(机器 id),房间名/设备名来自设备配置——仍与住户日志侧同口径折叠。
@@ -133,8 +142,9 @@ def build_rule_callbacks_text(callbacks: list[RuleTriggerCallback]) -> str | Non
         reason = oneline(c.trigger_reason)
         if reason:
             lines.append(f"触发原因：{reason.rstrip('。.')}")
-        head = "\n".join(lines)
-        return f"{head}\n\n{c.prompt_text}" if head else c.prompt_text
+        head = fence("\n".join(lines)) if lines else ""
+        prompt_text = sanitize_text(c.prompt_text)
+        return f"{head}\n\n{prompt_text}" if head else prompt_text
 
     body = "\n\n═══\n\n".join(_fmt(c) for c in callbacks)
     return f"{HEADER_MATCHED_RULE}\n{body}"
