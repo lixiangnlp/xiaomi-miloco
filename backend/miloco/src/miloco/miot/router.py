@@ -31,6 +31,7 @@ from miloco.miot.schema import (
     CameraVoiceToggleRequest,
     DeviceControlRequest,
     HomeSwitchRequest,
+    IntentResolveRequest,
     MipsStatusResponse,
     SendNotifyRequest,
 )
@@ -282,6 +283,27 @@ async def control_device(
     return NormalResponse(
         code=0, message="Device control executed successfully", data=data
     )
+
+
+@router.post(
+    path="/intent/resolve",
+    summary="Resolve a device-control intent into concrete candidates",
+    response_model=NormalResponse,
+)
+async def resolve_intent(
+    request: IntentResolveRequest,
+    current_user: str = Depends(verify_token),
+):
+    """把“房间 / 目标 / 属性 / 值”解析成可下发的候选（did + spec_name + 补 on + 校验）。
+
+    只解析不下发；``ambiguity`` / ``hint`` 告诉调用方（agent）下一步该做什么。
+    """
+    logger.info(
+        "Resolve intent API called, user=%s, room=%s, target=%s, action=%s, property=%s",
+        current_user, request.room, request.target, request.action, request.property,
+    )
+    data = await manager.miot_service.resolve_intent(request)
+    return NormalResponse(code=0, message="ok", data=data)
 
 
 @router.get(
