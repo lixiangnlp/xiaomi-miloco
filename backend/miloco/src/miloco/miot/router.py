@@ -24,6 +24,7 @@ from miloco.middleware import (
 )
 from miloco.middleware.exceptions import HTTPException
 from miloco.miot.schema import (
+    ApplyChangeRequest,
     AuthorizeRequest,
     CameraCropToggleRequest,
     CameraPromptRequest,
@@ -31,6 +32,7 @@ from miloco.miot.schema import (
     CameraVoiceToggleRequest,
     DeviceControlRequest,
     HomeSwitchRequest,
+    IntentResolveRequest,
     MipsStatusResponse,
     SendNotifyRequest,
 )
@@ -282,6 +284,69 @@ async def control_device(
     return NormalResponse(
         code=0, message="Device control executed successfully", data=data
     )
+
+
+@router.post(
+    path="/intent/resolve",
+    summary="Resolve a device-control intent into concrete candidates",
+    response_model=NormalResponse,
+)
+async def resolve_intent(
+    request: IntentResolveRequest,
+    current_user: str = Depends(verify_token),
+):
+    """把“房间 / 目标 / 属性 / 值”解析成可下发的候选（did + spec_name + 补 on + 校验）。
+
+    只解析不下发；``ambiguity`` / ``hint`` 告诉调用方（agent）下一步该做什么。
+    """
+    logger.info(
+        "Resolve intent API called, user=%s, room=%s, target=%s, action=%s, property=%s",
+        current_user, request.room, request.target, request.action, request.property,
+    )
+    data = await manager.miot_service.resolve_intent(request)
+    return NormalResponse(code=0, message="ok", data=data)
+
+
+@router.get(
+    path="/changes",
+    summary="List staged device changes awaiting user confirmation",
+    response_model=NormalResponse,
+)
+async def list_changes(current_user: str = Depends(verify_token)):
+    """受保护设备的待确认变更列表（不含 confirm_token）。"""
+    data = await manager.miot_service.list_changes()
+    return NormalResponse(code=0, message="ok", data=data)
+
+
+@router.post(
+    path="/changes/{change_id}/apply",
+    summary="Apply a staged device change with the user's confirm token",
+    response_model=NormalResponse,
+)
+async def apply_change(
+    change_id: str,
+    request: ApplyChangeRequest,
+    current_user: str = Depends(verify_token),
+):
+    """用户确认后下发：token 一次性；apply 时重查 scope / 重跑值校验。"""
+    logger.info(
+        "Apply change API called, user: %s, change_id: %s", current_user, change_id
+    )
+    data = await manager.miot_service.apply_change(change_id, request.confirm_token)
+    return NormalResponse(code=0, message="Staged change applied", data=data)
+
+
+@router.delete(
+    path="/changes/{change_id}",
+    summary="Discard a staged device change",
+    response_model=NormalResponse,
+)
+async def discard_change(change_id: str, current_user: str = Depends(verify_token)):
+    logger.info(
+        "Discard change API called, user: %s, change_id: %s", current_user, change_id
+    )
+    data = await manager.miot_service.discard_change(change_id)
+    return NormalResponse(code=0, message="Staged change discarded", data=data)
 
 
 @router.get(

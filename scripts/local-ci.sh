@@ -7,6 +7,7 @@
 #   ./scripts/local-ci.sh --quick     # 仅跑改动相关模块（~3s）
 #   ./scripts/local-ci.sh --tests     # 仅跑测试，跳过 pr-review 门禁
 #   ./scripts/local-ci.sh --gate      # 仅跑 pr-review 门禁（拉云端 review comment 检查 🔴/🟡）
+#   ./scripts/local-ci.sh --evals     # 仅跑 Agent 行为评测（用例校验 + 录制回放 + 框架自测，对齐 ci.yml agent-evals）
 #
 # 已知局限 (macOS):
 #   - 跳过 e2e/agent 目录（需运行中 server）
@@ -125,6 +126,36 @@ run_shellcheck() {
         ok "install-hermes.sh 语法"
     else
         fail "install-hermes.sh 语法"
+    fi
+}
+
+# ---- Agent 行为评测 (对齐 ci.yml agent-evals) -----------------------------------
+run_agent_evals() {
+    info "Agent 行为评测：用例校验…"
+    cd "$REPO_ROOT/evals"
+    if uv sync -q && uv run evals validate; then
+        ok "evals validate"
+    else
+        fail "evals validate"
+    fi
+    info "Agent 行为评测：回放录制并比对 baseline（无录制时全 PENDING）…"
+    if uv run evals replay --recordings recordings --baseline baseline.json; then
+        ok "evals replay"
+    else
+        fail "evals replay（出现 baseline 之外的新失败）"
+    fi
+    info "Agent 行为评测：框架自测…"
+    if uv run pytest -q 2>&1 | tail -3; then
+        ok "evals pytest"
+    else
+        fail "evals pytest"
+    fi
+    cd "$REPO_ROOT"
+    info "skill 改动须带 evals（warn-only）…"
+    if python3 scripts/check-skill-evals.py; then
+        ok "check-skill-evals"
+    else
+        fail "check-skill-evals"
     fi
 }
 
@@ -307,10 +338,14 @@ main() {
         --gate)
             run_pr_review_gate
             ;;
+        --evals)
+            run_agent_evals
+            ;;
         *)
             run_backend_tests
             run_hermes_tests
             run_shellcheck
+            run_agent_evals
             run_pr_review_gate
             ;;
     esac

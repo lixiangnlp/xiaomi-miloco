@@ -84,16 +84,36 @@ jobs:
       - name: 构建（vite）
         run: cd web && pnpm build
 
+  # ── agent-evals：Agent 行为评测——校验用例 + 回放录制比对 baseline（不调模型；无录制时全 PENDING、退出 0）──
+  agent-evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: evals/uv.lock
+      - name: 用例校验（含 identity-register 旧格式转换）
+        run: cd evals && uv sync && uv run evals validate
+      - name: 回放录制并比对 baseline
+        run: cd evals && uv run evals replay --recordings recordings --baseline baseline.json
+      - name: 评测框架自测
+        run: cd evals && uv run pytest -q
+      - name: skill 改动须带 evals（warn-only）
+        run: python3 scripts/check-skill-evals.py --base "origin/${{ github.base_ref || 'main' }}"
+
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: ./.github/actions/setup-all
-      - name: ruff（backend + cli）
-        # 用 backend 环境的 ruff 一次扫两处：ruff 是纯静态分析无需装 cli 依赖，
+      - name: ruff（backend + cli + evals）
+        # 用 backend 环境的 ruff 一次扫三处：ruff 是纯静态分析无需装 cli / evals 依赖，
         # 且会按各自 pyproject 解析配置（cli 未把 ruff 列为依赖，故不能 cd cli && uv run ruff）。
         run: |
           cd backend && uv sync --all-packages
-          uv run ruff check . "$GITHUB_WORKSPACE/cli"
+          uv run ruff check . "$GITHUB_WORKSPACE/cli" "$GITHUB_WORKSPACE/evals"
       - name: 类型检查（openclaw 插件，tsc --noEmit）
         run: cd plugins/openclaw && pnpm install --frozen-lockfile && pnpm check
