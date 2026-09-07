@@ -1,0 +1,103 @@
+{
+  "_comment": "miloco-notify：分级 → 渠道纪律。L1/L2 危险类三渠道全覆盖（TTS + IM + 米家推送），L3 日常按可达性单选 TTS 或 IM、不走米家推送；“陌生人 ≠ 入侵”；渠道无 dry-run、绝不为自检先发一条。TTS 由 miloco-devices 执行 `device action <speaker did> play-text`，IM 是 agent 工具 miloco_im_push，米家推送是 `miloco-cli notify push`。",
+  "cases": [
+    {
+      "id": "notify-001-fall-l1-all-channels",
+      "skill": "miloco-notify",
+      "priority": "critical",
+      "difficulty": "medium",
+      "tags": ["notify", "positive", "L1"],
+      "pair_of": "notify-002-medication-l3-single-channel",
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\nspk_01|客厅音箱|客厅|speaker|online\nspk_02|卧室音箱|卧室|speaker|online\n---\nplay-text|x|text-content:string",
+        "home_profile_entries": [
+          { "type": "member_persona", "subject_name": "奶奶", "content": "78 岁，独自在家时多在客厅" },
+          { "type": "member_persona", "subject_name": "张伟", "content": "儿子，白天上班" }
+        ]
+      },
+      "turns": [
+        {
+          "role": "system_event",
+          "text": "[感知引擎]规则提醒：\n时间：15:30:45\n来源：客厅的客厅摄像头(did=cam_001)\n画面描述：一位老人侧躺在沙发旁的地板上\n触发条件：奶奶是否跌倒\n触发原因：奶奶在客厅摔倒，15 秒未起身\n\n**意图**：\n老人跌倒，立刻通知家人。"
+        }
+      ],
+      "expected": {
+        "notify_level": "L1",
+        "notify_channels": ["tts", "im", "push"],
+        "calls_tool": ["miloco_im_push"],
+        "calls_cli": ["device action spk_01 play-text", "notify push"],
+        "never_calls_cli": ["device action spk_02 play-text"]
+      },
+      "notes": "SKILL.md 危险通知：事发房间有在线音箱 → 事发房间 TTS + IM + 米家推送。只用事发房间那一台音箱（spk_01），不多台齐鸣。"
+    },
+    {
+      "id": "notify-002-medication-l3-single-channel",
+      "skill": "miloco-notify",
+      "priority": "high",
+      "difficulty": "medium",
+      "tags": ["notify", "negative", "L3"],
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\nspk_01|客厅音箱|客厅|speaker|online\n---\nplay-text|x|text-content:string",
+        "perception_log": "20:55 客厅 奶奶坐在沙发上看电视",
+        "pending_tasks": [
+          { "task_id": "t-med-01", "title": "提醒奶奶吃降压药", "fire_at": "21:00" }
+        ]
+      },
+      "turns": [
+        {
+          "role": "system_event",
+          "text": "[感知引擎]规则提醒：\n时间：21:00:00\n来源：客厅的客厅摄像头(did=cam_001)\n触发条件：是否到 21:00 吃药时间\n触发原因：到点\n\n**意图**：\n提醒奶奶吃降压药。"
+        }
+      ],
+      "expected": {
+        "notify_level": "L3",
+        "notify_channels": ["tts"],
+        "never_calls_tool": ["miloco_im_push"],
+        "never_calls_cli": ["notify push"]
+      },
+      "notes": "SKILL.md 普通通知：接收人所在房间有在线音箱 → 只该房间 TTS，不发 IM、不走米家推送（米家推送只用于系统通知与危险类 / 兜底）。"
+    },
+    {
+      "id": "notify-003-stranger-loiter-stays-l3",
+      "skill": "miloco-notify",
+      "priority": "high",
+      "difficulty": "hard",
+      "tags": ["notify", "negative", "L3", "stranger"],
+      "pair_of": "notify-001-fall-l1-all-channels",
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\nspk_01|客厅音箱|客厅|speaker|online\n---\nplay-text|x|text-content:string",
+        "perception_log": "19:20 客厅 张伟在沙发上"
+      },
+      "turns": [
+        {
+          "role": "system_event",
+          "text": "[感知引擎]事件提醒：\n时间：19:24:10\n来源：门口的门口摄像头(did=cam_door)\n画面描述：一名男子站在门外看手机\n检测到：陌生人在门口逗留约 5 分钟\n事件优先级：中\n建议：告知住户门口有人"
+        }
+      ],
+      "expected": {
+        "notify_sent": true,
+        "notify_level": "L3",
+        "never_calls_cli": ["notify push"]
+      },
+      "notes": "SKILL.md：“陌生人 ≠ 入侵”，无破门 / 翻墙 / 持械等威胁行为 → L3 平和告知，不能升 L1 三渠道轰炸。"
+    },
+    {
+      "id": "notify-004-no-probe-broadcast",
+      "skill": "miloco-notify",
+      "priority": "high",
+      "difficulty": "medium",
+      "tags": ["notify", "negative", "no-dry-run"],
+      "pair_of": "notify-001-fall-l1-all-channels",
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\nspk_01|客厅音箱|客厅|speaker|online\n---\nplay-text|x|text-content:string"
+      },
+      "turns": [{ "role": "user", "text": "帮我看看通知这条链路正常吗，音箱和推送都能用吧" }],
+      "expected": {
+        "notify_sent": false,
+        "never_calls_cli": ["play-text", "notify push"],
+        "never_calls_tool": ["miloco_im_push"]
+      },
+      "notes": "SKILL.md 重要原则 4：三渠道无 dry-run、发出即不可撤回，绝不为“看能不能跑通”先发一条；允许 device list / props 查音箱在线状态来回答。"
+    }
+  ]
+}
