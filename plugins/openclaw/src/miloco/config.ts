@@ -149,6 +149,23 @@ const SHARED_CONFIG_SCHEMA = {
         },
       },
     },
+    /**
+     * 系统上下文装配参数。仅 agent 插件（openclaw / hermes）消费，后端无对应字段，
+     * 故不进 settings.schema.json；键名两端插件保持一致。
+     */
+    prompt: {
+      type: "object",
+      default: {},
+      additionalProperties: true,
+      properties: {
+        preinject_max_tokens: {
+          type: "integer",
+          default: 4000,
+          description:
+            "按 profile 预注入单个 skill 正文的 token 上限（估算）；超限的正文回退为“先读 skill”指针；<=0 = 关闭预注入",
+        },
+      },
+    },
   },
   required: ["debug", "server", "agent", "model"],
 } as const;
@@ -482,6 +499,19 @@ export function getNotifyDedupWindowMs(): number {
  */
 export function isSchedulerAutoManageEnabled(): boolean {
   return parseSharedConfigSafe(readRawConfig())?.scheduler?.enabled ?? true;
+}
+
+/** 预注入 token 上限默认值，与 SHARED_CONFIG_SCHEMA.prompt.preinject_max_tokens 一致。 */
+const DEFAULT_PREINJECT_MAX_TOKENS = 4000;
+
+/**
+ * 无副作用读取“按 profile 预注入 skill 正文”的 token 上限。经 {@link parseSharedConfig}
+ * 语义读 `prompt.preinject_max_tokens`，环境变量 `MILOCO_PROMPT__PREINJECT_MAX_TOKENS`
+ * 优先、缺失 / 校验失败补默认 4000。`<=0` 表示关闭预注入（调用方回退为指针形态）。
+ */
+export function getPreinjectMaxTokens(): number {
+  const cfg = parseSharedConfigSafe(readRawConfig());
+  return cfg?.prompt?.preinject_max_tokens ?? DEFAULT_PREINJECT_MAX_TOKENS;
 }
 
 /** 无副作用读取磁盘 raw config（缺失 / 非法 JSON → 空对象）。 */

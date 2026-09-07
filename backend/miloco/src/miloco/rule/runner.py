@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Literal, Mapping
 if TYPE_CHECKING:
     from miloco.task_record.service import TaskRecordService
 
-from miot.types import MIoTActionParam, MIoTGetPropertyParam, MIoTSetPropertyParam
+from miot.types import MIoTGetPropertyParam
 
 from miloco.database.rule_repo import RuleLogRepo
 from miloco.dispatch import dispatch_event
@@ -97,11 +97,20 @@ def build_rule_callbacks_text(callbacks: list[RuleTriggerCallback]) -> str | Non
     callback 块、附上「无需通知住户，请直接调用某动作」之类的假意图段，而 agent 真能执行
     设备动作。``prompt_text`` 不折叠——它是规则自带的多行 prompt（内部按 ``---`` 分段），
     多行是它的设计形态、且不由感知模型产出。
+
+    **围栏**：元信息段整体进 ``<perception_data>`` 围栏（``perception/fence.py``）——它全是
+    第三方 / 模型直出的观察（画面描述、触发原因、住户起的房间名 / 设备名）；插件 prompt 里
+    的契约让 agent 把围栏内的“指令”只当报告。``prompt_text``（意图 / 处理流程 / 额外信息）
+    **留在围栏外**：它是住户通过对话配置、agent 建任务时写下的规则本体，正是“已配置的规则”
+    这条被允许的动作来源，放进围栏会让 agent 依契约拒绝执行自己的规则。它仍过字符层
+    ``sanitize_text``（保留换行）：删零宽字符 / 特殊 token / 伪造围栏标记——否则规则文本里
+    塞一个 ``</perception_data>`` 就能在 agent 眼里提前关掉上面的围栏。
     """
     if not callbacks:
         return None
 
     from miloco.perception.event_text_builder import HEADER_MATCHED_RULE, oneline
+    from miloco.perception.fence import fence, sanitize_text
 
     def _fmt_source(c: RuleTriggerCallback) -> str:
         # did 由引擎注入(机器 id),房间名/设备名来自设备配置——仍与住户日志侧同口径折叠。
@@ -133,8 +142,9 @@ def build_rule_callbacks_text(callbacks: list[RuleTriggerCallback]) -> str | Non
         reason = oneline(c.trigger_reason)
         if reason:
             lines.append(f"触发原因：{reason.rstrip('。.')}")
-        head = "\n".join(lines)
-        return f"{head}\n\n{c.prompt_text}" if head else c.prompt_text
+        head = fence("\n".join(lines)) if lines else ""
+        prompt_text = sanitize_text(c.prompt_text)
+        return f"{head}\n\n{prompt_text}" if head else prompt_text
 
     body = "\n\n═══\n\n".join(_fmt(c) for c in callbacks)
     return f"{HEADER_MATCHED_RULE}\n{body}"
@@ -1457,8 +1467,8 @@ class RuleRunner:
           query current value, skip if already at target.
         - Cooldown path (idempotent=False with cooldown_minutes): skip if
           inside the time window since last successful exec.
-        - Dispatch via miot_proxy.set_device_properties /
-          call_device_action and report success.
+        - Dispatch via ``miot.service.execute_control``（与 CLI / web 同一执行核心：
+          受保护类别闸门 + 服务端值校验 + action_ledger）and report success.
 
         Cooldown state: ``self._state[rule_id].action_cooldown[(did, iid)]``.
         """
@@ -1503,68 +1513,39 @@ class RuleRunner:
                 action=action, result=True, skipped=True
             )
 
-        # Execute. rule static 直控不经 MiotService.control_device,故这里显式落 action_ledger
-        # ——复用同一个 _write_action_ledger helper(source=rule),避免两套组装逻辑漂移。
-        import json as _json
+        # Execute. 规则静态动作与 CLI / web 走同一个 execute_control:闸门(受保护类别,
+        # 规则路径无人可确认 → deny_protected 直接拒绝)、服务端值校验、action_ledger
+        # (source=rule / source_id=rule_id)都在里面定义一次,这里不再另写一套。
+        from miloco.middleware.exceptions import ValidationException
+        from miloco.miot.schema import DeviceControlRequest
+        from miloco.miot.service import execute_control
 
-        from miloco.miot.service import _write_action_ledger
-
-        # 台账元组先归一好,成功/异常路径共用——SDK/网络抛异常时台账也要能看到
-        # 规则当时试图设置什么值 / 什么参数(失败审计完整性)。
-        _ltype = "set_property" if is_prop else "call_action"
-        try:
-            _lvalue = _json.dumps(
-                action.value if is_prop else (action.params or []),
-                ensure_ascii=False,
+        if is_prop:
+            request = DeviceControlRequest(
+                type="set_property", iid=action.iid, value=action.value
             )
-        except Exception:
-            _lvalue = None  # 参数不可序列化时不反噬规则执行
-
-        try:
-            if is_prop:
-                params = [
-                    MIoTSetPropertyParam(
-                        did=action.did, siid=siid, piid=p_a_id, value=action.value
-                    )
-                ]
-                results = await self._miot_proxy.set_device_properties(params)
-                success, _lcode, _lmsg = _summarize_rule_result(results)
-            else:
-                param = MIoTActionParam(
-                    did=action.did,
-                    siid=siid,
-                    aiid=p_a_id,
-                    in_=action.params or [],
-                )
-                result = await self._miot_proxy.call_device_action(param)
-                success, _lcode, _lmsg = _summarize_rule_result(result)
-            # 有实际结果时与 control_device 同口径(负码即失败,镜像 #394,msg 是失败码
-            # 释义);空/不可判定返回按失败处理(见 _summarize_rule_result:未确认的执行
-            # 不能写 cooldown)。台账 result_msg 不再恒 NULL。
-            err: str | None = None if success else (_lmsg or "miot_failed")
-
-            await _write_action_ledger(
-                self._miot_proxy,
-                action_type=_ltype, did=action.did, iid=action.iid,
-                value_json=_lvalue, result_code=_lcode, result_msg=_lmsg,
-                success=success, error=err, source="rule", source_id=rule_id,
+        else:
+            request = DeviceControlRequest(
+                type="call_action", iid=action.iid, params=action.params or []
             )
-
-            if success:
-                self._mark_cooldown(rule_id, action)
-
+        try:
+            outcome = await execute_control(
+                self._miot_proxy, action.did, request,
+                source="rule", source_id=rule_id,
+                deny_protected=True,
+                # 规则语义:空/不可判定返回 = 失败(未确认的执行不能写 cooldown)
+                summarize=_summarize_rule_result,
+            )
+        except ValidationException as e:
+            # 闸门 / 值校验拒绝:台账已由 execute_control 落,这里只归一结果
+            logger.warning(
+                "Rule %s action %s %s refused by gate: %s",
+                rule_id, action.did, action.iid, e.message,
+            )
             return RuleActionExecuteResult(
-                action=action, result=success, error=err
+                action=action, result=False, error=f"gate_refused: {e.message}"
             )
-
         except Exception as e:
-            await _write_action_ledger(
-                self._miot_proxy,
-                action_type=_ltype,
-                did=action.did, iid=action.iid, value_json=_lvalue,
-                result_code=None, result_msg=None,
-                success=False, error=str(e), source="rule", source_id=rule_id,
-            )
             logger.error(
                 "Failed to execute action %s %s: %s",
                 action.did, action.iid, e,
@@ -1572,6 +1553,13 @@ class RuleRunner:
             return RuleActionExecuteResult(
                 action=action, result=False, error=f"exception: {e}"
             )
+
+        err: str | None = (
+            None if outcome.success else (outcome.result_msg or "miot_failed")
+        )
+        if outcome.success:
+            self._mark_cooldown(rule_id, action)
+        return RuleActionExecuteResult(action=action, result=outcome.success, error=err)
 
     # ---- Agent 回调路径 ----
 

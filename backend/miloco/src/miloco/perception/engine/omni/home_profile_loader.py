@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 
 from miloco.home_profile.store import profile_md_path
+from miloco.perception.fence import sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,12 @@ def get_home_profile_prefix() -> str:
         logger.warning("读取家庭档案失败: %s", profile_file, exc_info=True)
         return ""
 
-    body = content.strip()
+    # 档案正文是住户 / agent 写的 free-text，直接进 omni 的 system prompt：先过字符层清洗
+    # （``perception/fence.py``，保留换行与 markdown 结构）——删零宽 / 双向控制字符、
+    # ``<system>`` 类特殊 token 与伪造围栏标记。放在剥宠物段之前：藏在“## 宠物”标题里的
+    # 零宽字符会让下面的整行比对失配、护栏被绕过。不包围栏：omni prompt 自有分层结构，
+    # 这里只做最小加固。
+    body = sanitize_text(content).strip()
     if not body:
         return ""
     return body if _pet_recognition_on() else _strip_pet_section(body)
