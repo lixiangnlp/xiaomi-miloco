@@ -85,8 +85,9 @@ describe("extractSections", () => {
     expect(out).not.toContain("甲的正文");
   });
 
-  it("找不到的标题跳过；全部找不到返回空串", () => {
-    expect(extractSections(body, ["不存在", "乙"])).toContain("乙的正文");
+  it("缺少任一必需标题时返回空串", () => {
+    expect(extractSections(body, ["不存在", "乙"])).toBe("");
+    expect(extractSections(body, ["乙", "不存在"])).toBe("");
     expect(extractSections(body, ["不存在"])).toBe("");
   });
 

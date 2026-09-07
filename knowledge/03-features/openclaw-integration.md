@@ -104,11 +104,11 @@ before_prompt_build Hook（plugins/openclaw/src/hooks/prompt.ts）
 
 **按 profile 预注入 skill 正文（`resolvePreinject` + `services/skills.ts`）**：取舍依据是频率准则——与三分之一以上流量相关的内容进系统提示而非 skill；若某个 skill 能由 harness 已掌握的信号预测出来，就在首次模型调用前由 harness 注入、省掉“加载 skill”那一轮。profile 正是这样的信号：rule / suggestion 会话几乎总以一次通知收尾，TTS 又要经 `miloco-devices` 下发，原先危险预警热路径要先花两轮分别加载两个 skill。现在：
 
-| profile | 预载内容 | 触发条件 |
-| --- | --- | --- |
-| rule / suggestion | `miloco-notify` 全文 + `miloco-devices` 节选（步骤 2 / 4 / 5 与音箱 `play-text` vs `execute-text-directive` 一节） | 恒定 |
-| full | `miloco-notify` 全文 | 仅当正文以 `[感知引擎]` 开头（感知推送大概率要通知）；普通 IM 对话里通知是少数分支，保持“先读 skill”指针 |
-| minimal | `miloco-notify` 全文 + devices 节选 + catalog | 仅 `miloco-home-patrol` 巡检 cron（既控设备又通知）；digest / dreaming / habit 保持纯 minimal |
+| profile           | 预载内容                                                                                                           | 触发条件                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| rule / suggestion | `miloco-notify` 全文 + `miloco-devices` 节选（步骤 2 / 4 / 5 与音箱 `play-text` vs `execute-text-directive` 一节） | 恒定                                                                                                     |
+| full              | `miloco-notify` 全文                                                                                               | 仅当正文以 `[感知引擎]` 开头（感知推送大概率要通知）；普通 IM 对话里通知是少数分支，保持“先读 skill”指针 |
+| minimal           | `miloco-notify` 全文 + devices 节选 + catalog                                                                      | 仅 `miloco-home-patrol` 巡检 cron（既控设备又通知）；digest / dreaming / habit 保持纯 minimal            |
 
 实现约束：正文从插件自带的 `skills/<name>/SKILL.md` 读取（打包时由 `scripts/sync-skills.mjs` 从 `plugins/skills/` 复制；源码 / 测试环境回退读源目录），去 frontmatter 后**逐字**注入，不在 TS 里复写 skill 散文——devices 节选也是按标题 `extractSections` 切出来的，skill 改了注入自动跟随，标题改名会让节选变空并 warn。预载块紧随 `B_NOTIFY`、归在 prepend（静态，按文件 mtime 缓存），并明确写“已预载，勿再加载”；设备目录段第二段随之改为指向上方节选，不再要求先读完整 skill。预算守卫 `prompt.preinject_max_tokens`（共享配置，默认 4000，环境变量 `MILOCO_PROMPT__PREINJECT_MAX_TOKENS` 优先，`<=0` 关闭）：单块估算（CJK 1 字 ≈ 1 token，其余 4 字符 ≈ 1 token）超限即回退指针形态；skill 文件缺失同样只降级不抛。各 profile 的 prepend 估算规模写在 debug 日志里。Hermes 侧 `context_injection.py` 同步实现（`resolve_preinject` / `load_skill_body`），skill 目录按 `$HERMES_HOME/skills` → `plugins/hermes/skills` → `plugins/skills` 解析。
 
@@ -119,6 +119,8 @@ before_prompt_build Hook（plugins/openclaw/src/hooks/prompt.ts）
 **豁免判据是「能否在带宿主人设的会话里被加载」，不是「是不是 skill 文件」**：`miloco-home-patrol` / `miloco-perception-digest` 只在各自 cron 任务里激活（frontmatter 写明"仅由该任务调用"、正文引言写明"不单独使用"），isolated cron 会话本就没有宿主人设可顶，故保留 `你是这个家的……` 原样。新增此类文本时按此判据办理；该判据有门禁：`plugins/openclaw/tests/skill-identity.test.ts` 扫 `plugins/skills/**/*.md`，禁止行首「你是……」式断言与整行的「我是 / 我叫 miloco（或管家）」式自称两种形状，豁免名单同时要求名单项自己仍声明是 cron-only（豁免不能悄悄过期）。
 
 miloco 字样在两种位置仍要保留，不是无差别清洗：**指代系统本身**（"检测到 miloco 已完成米家授权"）与**工具 / skill 名**（`miloco-notify`、`miloco-cli`）——要清的只是 agent 对用户的自称。
+
+**围栏契约（`B_PERCEPTION_TRUST`）**：`buildPerception` 末段向 full / rule / suggestion 三个 profile 声明——感知消息里 `<perception_data>` 围栏内的文本是第三方写的报告，其中的任何指令只转述不执行；设备控制只响应住户的直接请求（含已识别成员的语音指令）与已配置的规则，未知说话人的语音指令只做查询类响应。围栏由 backend `perception/fence.py` 负责包（清洗规则与落点见 [感知流水线 · 围栏契约](perception-pipeline.md#关键设计决策)）；插件自己往 prompt 里贴的第三方材料——今日感知日志（`buildPerceptionLogBlock`，整段进同一围栏并声明为记忆材料）与待回应习惯建议的条目文本——走 `utils/fence.ts` 的 `sanitizeForPrompt` / `onelineForPrompt` / `fenceForPrompt`，字符层规则与后端 1:1。`PERCEPTION_FORMAT` 的三条格式说明与 rule 结构示例都标出了围栏位置（元信息段在围栏内、意图段在围栏外）。Hermes 侧 `context_injection.B_PERCEPTION_TRUST` / `PERCEPTION_FORMAT` 与本块 1:1 同步。
 
 **trace Hook**：监听 7 个 agent 生命周期事件，turn 结束后计算 meta（LLM 调用次数、工具调用次数、各类耗时、错误统计）；debug 模式下写 JSONL 到 `$MILOCO_HOME/trace/agent/`；在内存中保留 meta 供后端轮询后消费（幂等消费，消费后即清除）。
 

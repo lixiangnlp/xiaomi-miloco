@@ -157,6 +157,7 @@ knowledge/
   - [事件反馈打包](03-features/event-feedback.md)
   - [一键升级](03-features/one-click-upgrade.md)
 - **04-testing** — [评测方法论](04-testing/README.md)
+  - [Agent 行为评测（evals）](04-testing/agent-evals.md)
 - **05-external-deps**
   - [MiOT SDK](05-external-deps/sdk-miot.md)
   - [ONNX Runtime](05-external-deps/sdk-onnxruntime.md)

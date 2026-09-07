@@ -56,7 +56,7 @@ const HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/;
 
 /**
  * 按标题文本抽取若干小节（含标题行，直到下一个同级或更高级标题为止），按传入顺序拼接。
- * 标题匹配去掉 `#` 前缀后按 trim 全等比较；找不到的标题跳过。全部找不到返回空串。
+ * 标题匹配去掉 `#` 前缀后按 trim 全等比较；任一必需标题找不到就返回空串，禁止把残缺流程标记为已预载。
  * 用于把 skill 正文中“预注入只需要的那几节”切出来，同时保持文本单一来源。
  */
 export function extractSections(md: string, headings: readonly string[]): string {
@@ -74,7 +74,7 @@ export function extractSections(md: string, headings: readonly string[]): string
         break;
       }
     }
-    if (start < 0) continue;
+    if (start < 0) return "";
     let end = lines.length;
     for (let i = start + 1; i < lines.length; i++) {
       const m = HEADING_RE.exec(lines[i]);

@@ -1,3 +1,4 @@
+import { onelineForPrompt } from "../utils/fence.js";
 import { readJsonFileSync } from "../utils/io.js";
 import { nowLocalIso } from "../utils/time.js";
 import { habitSuggestionsPath } from "./helpers.js";
@@ -74,8 +75,14 @@ export function buildPendingSuggestionBlock(): string {
   }
   if (open.length === 0) return "";
 
+  // key / title / suggestion 是 habit-suggest LLM 写进 store 的 free-text，进 prompt 前过
+  // 字符层清洗 + 折成单行（与后端 oneline 同口径）：否则 suggestion 里一个 `\n\n## 通知用户`
+  // 就能在本段中插一节伪造指令。
   const items = open
-    .map((e) => `- [${e.key}] ${e.title}：${e.suggestion}`)
+    .map(
+      (e) =>
+        `- [${onelineForPrompt(e.key)}] ${onelineForPrompt(e.title)}：${onelineForPrompt(e.suggestion)}`,
+    )
     .join("\n");
 
   return `## 等用户回应的习惯建议
