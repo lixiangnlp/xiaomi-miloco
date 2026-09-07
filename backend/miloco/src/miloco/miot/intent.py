@@ -19,6 +19,7 @@ on”这一串确定性推理下沉到后端：输入用户的自然表述（房
 from __future__ import annotations
 
 import re
+import shlex
 from typing import Any
 
 # ─── 同义词表 ─────────────────────────────────────────────────────────────────
@@ -322,13 +323,24 @@ def normalize_value(entry: dict, value: Any) -> Any:
 
 
 def _split_room_from_target(target: str, rooms: list[str]) -> tuple[str | None, str]:
-    """“客厅的落地灯” → (客厅, 落地灯)。仅在 target 以已知房间名开头时拆。"""
-    for room in sorted(rooms, key=len, reverse=True):
-        if room and target.startswith(room) and len(target) > len(room):
-            rest = target[len(room):]
-            if rest.startswith("的"):
-                rest = rest[1:]
-            return room, rest.strip()
+    """识别房间前允许有请求前缀，如“请帮我把客厅的灯关闭”。
+
+    每次先匹配房间再剥一个前缀，避免把“开封”等房间名的首字当动词删掉。
+    没识别到房间时保留原 target，设备名匹配仍优先于类别回落。
+    """
+    remaining = target
+    prefixes = ("帮我", "给我", "打开", "关闭", "关掉", "开启", "请", "把", "开", "关")
+    while remaining:
+        for room in sorted(rooms, key=len, reverse=True):
+            if room and remaining.startswith(room) and len(remaining) > len(room):
+                rest = remaining[len(room):]
+                if rest.startswith("的"):
+                    rest = rest[1:]
+                return room, rest.strip()
+        prefix = next((p for p in prefixes if remaining.startswith(p)), None)
+        if prefix is None:
+            break
+        remaining = remaining[len(prefix):].lstrip()
     return None, target
 
 
@@ -585,31 +597,28 @@ def _compact_spec(iid: str, entry: dict, spec_name: str, matched_by: str) -> dic
 def _fmt_value(v: Any) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
-    s = str(v)
-    if s == "" or any(ch.isspace() for ch in s) or any(ch in s for ch in ";|&\"'"):
-        return '"' + s.replace('"', '\\"') + '"'
-    return s
+    return shlex.quote(str(v))
 
 
 def _command_for(cand: dict, action: str, value: Any) -> str | None:
-    did = cand["did"]
+    did = shlex.quote(cand["did"])
     spec = cand.get("spec")
     if action == "get":
         if spec is None:
             return f"miloco-cli device props {did}"
-        return f"miloco-cli device props {did} {spec['spec_name']}"
+        return f"miloco-cli device props {did} {shlex.quote(spec['spec_name'])}"
     if spec is None:
         return None
     if action == "call":
         params = value if isinstance(value, list) else ([] if value is None else [value])
         tail = "".join(f" {_fmt_value(p)}" for p in params)
-        return f"miloco-cli device action {did} {spec['spec_name']}{tail}"
+        return f"miloco-cli device action {did} {shlex.quote(spec['spec_name'])}{tail}"
     # set
     if value is None:
         return None
-    cmd = f"miloco-cli device control {did} --set {spec['spec_name']} {_fmt_value(value)}"
+    cmd = f"miloco-cli device control {did} --set {shlex.quote(spec['spec_name'])} {_fmt_value(value)}"
     if cand.get("needs_on"):
-        cmd += f" --set {cand['needs_on']['spec_name']} true"
+        cmd += f" --set {shlex.quote(cand['needs_on']['spec_name'])} true"
     return cmd
 
 

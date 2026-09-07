@@ -80,7 +80,7 @@ def test_resolve_endpoint_single_hit(client):
     assert [c["did"] for c in data["candidates"]] == ["AC1"]
     assert data["candidates"][0]["needs_on"] == {"spec_name": "on@空调", "iid": "prop.2.1"}
     assert data["command_preview"] == [
-        "miloco-cli device control AC1 --set target-temperature 26 --set on@空调 true"
+        "miloco-cli device control AC1 --set target-temperature 26 --set 'on@空调' true"
     ]
 
 

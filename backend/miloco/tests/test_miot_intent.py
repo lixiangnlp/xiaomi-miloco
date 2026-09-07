@@ -155,7 +155,7 @@ def test_single_hit_ac_temperature_adds_on_with_module_suffix(home):
     assert c["needs_on"] == {"spec_name": "on@空调", "iid": "prop.2.1"}
     assert c["protected"] is False
     assert res["command_preview"] == [
-        "miloco-cli device control AC1 --set target-temperature 26 --set on@空调 true"
+        "miloco-cli device control AC1 --set target-temperature 26 --set 'on@空调' true"
     ]
     assert "命中 1 台" in res["hint"]
 
@@ -164,7 +164,7 @@ def test_room_embedded_in_target_is_split_out(home):
     res = _resolve(home, target="卧室的空调", property="开")
     assert res["room"] == "卧室"
     assert _dids(res) == ["AC1"]
-    assert res["command_preview"] == ["miloco-cli device control AC1 --set on@空调 true"]
+    assert res["command_preview"] == ["miloco-cli device control AC1 --set 'on@空调' true"]
 
 
 def test_room_partial_match(home):
@@ -314,7 +314,7 @@ def test_enum_name_is_mapped_to_value(home):
     c = res["candidates"][0]
     assert c["value"] == 2
     assert res["command_preview"] == [
-        "miloco-cli device control AC1 --set fan-level 2 --set on@空调 true"
+        "miloco-cli device control AC1 --set fan-level 2 --set 'on@空调' true"
     ]
 
 
@@ -337,7 +337,7 @@ def test_switch_value_inferred_from_target_verb_when_property_omitted(home):
     assert all(c["value"] is False for c in res["candidates"])
     res = _resolve(home, target="打开空调")
     assert res["candidates"][0]["value"] is True
-    assert res["command_preview"] == ["miloco-cli device control AC1 --set on@空调 true"]
+    assert res["command_preview"] == ["miloco-cli device control AC1 --set 'on@空调' true"]
 
 
 def test_set_without_value_is_issue(home):
@@ -422,7 +422,7 @@ def test_call_action_with_params_quotes_text(home):
     res = _resolve(home, target="音箱", action="call", property="play-text", value="晚安 好梦")
     c = res["candidates"][0]
     assert c["spec"]["in_params"] == ["text-content:string"]
-    assert res["command_preview"] == ['miloco-cli device action SPK1 play-text "晚安 好梦"']
+    assert res["command_preview"] == ["miloco-cli device action SPK1 play-text '晚安 好梦'"]
 
 
 def test_call_action_multi_params(home):
@@ -430,7 +430,7 @@ def test_call_action_multi_params(home):
         home, target="音箱", action="call", property="execute-text-directive", value=["关灯", False]
     )
     assert res["command_preview"] == [
-        "miloco-cli device action SPK1 execute-text-directive 关灯 false"
+        "miloco-cli device action SPK1 execute-text-directive '关灯' false"
     ]
 
 
@@ -484,3 +484,48 @@ def test_validate_value_and_normalize_value_rules():
     assert normalize_value(enum, "auto") == 0
     assert normalize_value({"format": "bool"}, "关") is False
     assert normalize_value({"format": "float"}, "26.5") == 26.5
+
+
+@pytest.mark.parametrize("target", ["把客厅所有灯关闭", "请帮我把客厅所有灯关闭", "关闭客厅的所有灯"])
+def test_room_scope_survives_request_prefix(home, target):
+    result = resolve_intent(home, {"target": target, "action": "set", "value": False})
+    assert result["room"] == "客厅"
+    assert result["ambiguity"] == "none"
+    assert result["candidates"]
+    assert {c["room"] for c in result["candidates"]} == {"客厅"}
+    assert all(c["value"] is False for c in result["candidates"])
+
+
+@pytest.mark.parametrize("value", [
+    "请播报 $(printf REVIEW_PROBE)", "`printf REVIEW_PROBE`", "$HOME", "", "a'b\\\"c",
+    "a; echo bad", "line one\nline two", "trailing\\", "* ? [abc]",
+])
+def test_preview_preserves_literal_shell_arguments(home, value):
+    import json
+    import shlex
+    import subprocess
+    import sys
+
+    result = resolve_intent(home, {
+        "target": "音箱", "action": "call", "property": "play-text", "value": value,
+    })
+    # Replace only the executable with an argv-printing stub; no device/network I/O.
+    preview = result["command_preview"][0]
+    stub = shlex.join([sys.executable, "-c", "import json,sys; print(json.dumps(sys.argv[1:]))"])
+    output = subprocess.check_output(
+        ["/bin/sh", "-c", preview.replace("miloco-cli", stub, 1)], text=True,
+    )
+    assert json.loads(output) == ["device", "action", "SPK1", "play-text", value]
+
+
+def test_preview_quotes_spec_names_and_device_ids():
+    import shlex
+
+    from miloco.miot.intent import _command_for
+
+    candidate = {"did": "id$(printf bad)", "spec": {"spec_name": "on@$(printf_bad)"},
+                 "needs_on": {"spec_name": "on@`printf_bad`"}}
+    assert shlex.split(_command_for(candidate, "set", False)) == [
+        "miloco-cli", "device", "control", candidate["did"], "--set",
+        candidate["spec"]["spec_name"], "false", "--set", candidate["needs_on"]["spec_name"], "true",
+    ]
