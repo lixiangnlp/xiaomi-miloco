@@ -61,7 +61,7 @@ _STAGED = {
         "category": "camera",
         "summary": "set prop.2.1 = False",
         "expires_at": "2026-09-07T10:10:00+08:00",
-        "confirm_token": "tok-abc",
+        "confirmation_channel": "mihome",
         "next": "…",
     },
 }
@@ -78,7 +78,8 @@ def test_device_control_prints_staged_hint(runner, fake_home_info):
     assert out["did"] == "cam_001"
     assert out["category"] == "camera"
     assert out["summary"] == "set prop.2.1 = False"
-    assert out["confirm_token"] == "tok-abc"
+    assert "confirm_token" not in out
+    assert out["confirmation_channel"] == "mihome"
     assert "device apply chg-0001 --token" in out["next"]
     assert "device discard chg-0001" in out["next"]
     # staged 不是设备执行结果，不应被误当成功 / 失败去补 code_msg

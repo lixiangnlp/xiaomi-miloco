@@ -1399,6 +1399,34 @@ class MiotProxy:
             logger.error("Failed to send app notify: %s", e)
             return False
 
+    async def send_device_confirmation(self, content: str) -> bool:
+        """Deliver a one-time approval credential directly to MiHome, never to an agent.
+
+        Use an ephemeral notification template, not the ordinary notification cache.
+        Always delete the cloud template, including when delivery fails. Do not log
+        provider errors: they may echo the credential-bearing request or response.
+        """
+        notify_id = None
+        sent = False
+        try:
+            notify_id = await self._miot_client.create_app_notify_async(content)
+            if not notify_id:
+                return False
+            sent = bool(await self._miot_client.send_app_notify_async(notify_id))
+        except Exception:
+            logger.warning("Device confirmation notification delivery failed")
+            return False
+        finally:
+            if notify_id:
+                try:
+                    if not await self._miot_client.delete_app_notifies_async(notify_id):
+                        logger.warning("Device confirmation notification cleanup failed")
+                        sent = False
+                except Exception:
+                    logger.warning("Device confirmation notification cleanup failed")
+                    sent = False
+        return sent
+
     async def check_token_valid(self) -> bool:
         try:
             return await self._miot_client.check_token_async()

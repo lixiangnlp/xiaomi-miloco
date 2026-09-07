@@ -7,6 +7,7 @@ LRUStore 打 temp SQLite；配置走真实 get_settings()（默认 protected_cat
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from miloco.config.settings import reset_settings
 from miloco.database.kv_repo import ScopeConfigKeys
 from miloco.middleware.exceptions import (
     AuthorizationException,
+    MiotServiceException,
     ResourceNotFoundException,
     ValidationException,
 )
@@ -91,10 +93,17 @@ def _make_proxy(tmp_path: Path, store: dict[str, str]):
         ),
         set_device_properties=AsyncMock(return_value=[{"code": 0, "siid": 2, "piid": 1}]),
         call_device_action=AsyncMock(return_value={"code": 0}),
+        send_device_confirmation=AsyncMock(return_value=True),
         get_devices=AsyncMock(return_value={"lamp": LAMP, "cam": CAMERA}),
         get_cameras=AsyncMock(return_value={}),
         _fetch_device_spec=_fetch_spec,
     )
+
+
+def _delivered_token(svc):
+    # Simulate the user reading the private MiHome push, not the API response.
+    message = svc._miot_proxy.send_device_confirmation.await_args.args[0]
+    return re.search(r"确认码：([A-Za-z0-9_-]+)", message).group(1)
 
 
 @pytest.fixture
@@ -188,7 +197,8 @@ async def test_protected_category_is_staged_not_executed(svc):
     assert out["category"] == "camera"
     assert out["did"] == "cam"
     assert out["summary"] == "set prop.2.1 = False"
-    assert out["confirm_token"]
+    assert "confirm_token" not in out
+    assert out["confirmation_channel"] == "mihome"
     assert out["expires_at"]
     assert "device apply chg-0001" in out["next"]
     svc._miot_proxy.set_device_properties.assert_not_called()
@@ -234,7 +244,7 @@ async def test_protected_categories_follow_current_config(svc, monkeypatch):
 async def test_apply_with_correct_token_executes_once(svc):
     req = DeviceControlRequest(type="set_property", iid="prop.2.1", value=False)
     staged = await svc.control_device("cam", req)
-    out = await svc.apply_change(staged["change_id"], staged["confirm_token"])
+    out = await svc.apply_change(staged["change_id"], _delivered_token(svc))
     assert out["applied"] is True
     assert out["change_id"] == staged["change_id"]
     assert out["results"] == [{"code": 0, "siid": 2, "piid": 1}]
@@ -243,7 +253,7 @@ async def test_apply_with_correct_token_executes_once(svc):
     assert (sent.did, sent.siid, sent.piid, sent.value) == ("cam", 2, 1, False)
     # 一次性凭据：重放被拒
     with pytest.raises(ResourceNotFoundException):
-        await svc.apply_change(staged["change_id"], staged["confirm_token"])
+        await svc.apply_change(staged["change_id"], _delivered_token(svc))
     assert (await svc.list_changes())["changes"] == []
 
 
@@ -265,7 +275,7 @@ async def test_apply_expired_change_refused(svc):
     change = svc._changes._items[staged["change_id"]]
     change.expires_at_ms = change.created_at_ms - 1  # 人为过期
     with pytest.raises(ResourceNotFoundException) as ei:
-        await svc.apply_change(staged["change_id"], staged["confirm_token"])
+        await svc.apply_change(staged["change_id"], _delivered_token(svc))
     assert "expired" in ei.value.message
     svc._miot_proxy.set_device_properties.assert_not_called()
 
@@ -281,7 +291,7 @@ async def test_apply_after_scope_tightened_refused(svc, store):
     staged = await svc.control_device("cam", req)
     store[ScopeConfigKeys.HOME_WHITE_LIST_KEY] = json.dumps(["H2"])
     with pytest.raises(ValidationException) as ei:
-        await svc.apply_change(staged["change_id"], staged["confirm_token"])
+        await svc.apply_change(staged["change_id"], _delivered_token(svc))
     assert "not in an allowed home" in ei.value.message
     svc._miot_proxy.set_device_properties.assert_not_called()
 
@@ -360,3 +370,95 @@ async def test_rule_runner_static_action_goes_through_gate(tmp_path, store, monk
     res = await runner._execute_action("rule-1", ok)
     assert res.result is True and res.error is None
     proxy.set_device_properties.assert_awaited_once()
+
+
+async def test_agent_cannot_self_approve_using_stage_response(svc, caplog):
+    staged = await svc.control_device(
+        "cam", DeviceControlRequest(type="set_property", iid="prop.2.1", value=False)
+    )
+    token = _delivered_token(svc)
+    assert token not in json.dumps(staged)
+    assert token not in json.dumps(await svc.list_changes())
+    assert token not in caplog.text
+    with pytest.raises(AuthorizationException):
+        await svc.apply_change(staged["change_id"], staged.get("confirm_token"))
+    svc._miot_proxy.set_device_properties.assert_not_called()
+    # Only the credential delivered directly to the user authorizes this change.
+    await svc.apply_change(staged["change_id"], token)
+    svc._miot_proxy.set_device_properties.assert_awaited_once()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+async def test_failed_confirmation_delivery_revokes_change_without_leaking(svc, caplog, raises):
+    async def fail(content):
+        if raises:
+            raise RuntimeError(content)
+        return False
+
+    svc._miot_proxy.send_device_confirmation.side_effect = fail
+    with pytest.raises(MiotServiceException) as caught:
+        await svc.control_device(
+            "cam", DeviceControlRequest(type="set_property", iid="prop.2.1", value=False)
+        )
+    token = _delivered_token(svc)
+    assert token not in str(caught.value)
+    assert token not in caplog.text
+    assert (await svc.list_changes())["changes"] == []
+    svc._miot_proxy.set_device_properties.assert_not_called()
+
+
+async def test_confirmation_delivery_cancelled_revokes_change(svc):
+    import asyncio
+
+    svc._miot_proxy.send_device_confirmation.side_effect = asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await svc.control_device(
+            "cam", DeviceControlRequest(type="set_property", iid="prop.2.1", value=False)
+        )
+    assert (await svc.list_changes())["changes"] == []
+    svc._miot_proxy.set_device_properties.assert_not_called()
+
+
+async def test_confirmation_token_cannot_approve_another_change(svc):
+    req = DeviceControlRequest(type="set_property", iid="prop.2.1", value=False)
+    await svc.control_device("cam", req)
+    first_token = _delivered_token(svc)
+    second = await svc.control_device("cam", req)
+    assert _delivered_token(svc) != first_token
+    with pytest.raises(AuthorizationException):
+        await svc.apply_change(second["change_id"], first_token)
+    svc._miot_proxy.set_device_properties.assert_not_called()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_confirmation_transport_deletes_cloud_template(fails, caplog):
+    from miloco.miot.client import MiotProxy
+
+    client = SimpleNamespace(
+        create_app_notify_async=AsyncMock(return_value="private-notify-id"),
+        send_app_notify_async=AsyncMock(return_value=True),
+        delete_app_notifies_async=AsyncMock(return_value=True),
+    )
+    if fails:
+        client.send_app_notify_async.side_effect = RuntimeError("private-confirmation-content")
+    proxy = SimpleNamespace(_miot_client=client)
+    assert await MiotProxy.send_device_confirmation(proxy, "private-confirmation-content") is not fails
+    client.delete_app_notifies_async.assert_awaited_once_with("private-notify-id")
+    assert "private-confirmation-content" not in caplog.text
+
+
+@pytest.mark.parametrize("cleanup", [False, RuntimeError("private-confirmation-content")])
+async def test_confirmation_transport_cleanup_failure_is_not_success(cleanup, caplog):
+    from miloco.miot.client import MiotProxy
+
+    client = SimpleNamespace(
+        create_app_notify_async=AsyncMock(return_value="private-notify-id"),
+        send_app_notify_async=AsyncMock(return_value=True),
+        delete_app_notifies_async=AsyncMock(return_value=cleanup),
+    )
+    if isinstance(cleanup, Exception):
+        client.delete_app_notifies_async.side_effect = cleanup
+    assert await MiotProxy.send_device_confirmation(
+        SimpleNamespace(_miot_client=client), "private-confirmation-content"
+    ) is False
+    assert "private-confirmation-content" not in caplog.text

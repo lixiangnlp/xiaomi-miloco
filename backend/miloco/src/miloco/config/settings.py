@@ -263,7 +263,7 @@ class SafetySettings(BaseModel):
     """
 
     protected_categories: list[str] = Field(
-        default=["lock", "camera", "video-doorbell", "gas-sensor", "smoke-sensor"],
+        default=["lock", "camera", "video-doorbell", "gas-valve", "gas-sensor", "smoke-sensor"],
         description=(
             "需要用户二次确认才能控制的设备类别（MIoT spec 类别名）；"
             "空列表 = 关闭闸门（不推荐）"

@@ -172,7 +172,7 @@ class StagedChange:
     category: str
     device_name: str | None
     room: str | None
-    confirm_token: str
+    confirm_token: str = field(repr=False)
     created_at_ms: int
     expires_at_ms: int
     summary: str = field(default="")
@@ -268,8 +268,8 @@ class ChangeLedger:
         ):
             raise AuthorizationException(
                 f"confirm_token does not match change '{change_id}'; "
-                "the token is issued to the user when the change is staged — "
-                "ask the user to confirm and pass the token they were given"
+                "the token is delivered directly to the user's MiHome app — "
+                "ask the user to check the notification and provide its token if they approve"
             )
         return self._items.pop(change_id)
 

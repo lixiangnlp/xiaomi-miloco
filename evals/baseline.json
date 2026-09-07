@@ -1,0 +1,4 @@
+{
+  "note": "已知失败清单，键为 <case_id>:<scorer>（按轮的 scorer 形如 <case_id>:turn1:<scorer>）。replay 出现不在此清单的失败即退出码非零；修好后请把对应键删掉。",
+  "known_failures": []
+}

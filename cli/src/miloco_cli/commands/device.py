@@ -1,4 +1,4 @@
-"""device 命令组：list / spec / catalog / control / props / action / refresh / changes / apply / discard。"""
+"""device 命令组：list / spec / catalog / control / props / action / resolve / refresh / changes / apply / discard。"""
 
 import json
 import sys
@@ -109,8 +109,7 @@ def _print_if_staged(data: dict, did: str, pretty: bool) -> bool:
     """服务端把受保护设备（门锁 / 摄像头 / 燃气 / 烟感…）的控制 **stage** 而未执行时，
     输出给 agent 的提示并返回 True；否则返回 False 由调用方按普通结果处理。
 
-    confirm_token 是服务端签发的一次性确认凭据。当前阶段 CLI 是唯一用户面，凭据随
-    输出给到用户侧；后续 PR 会把凭据改投 IM / 面板，agent 不再可见。
+    确认码由后端直接投递到米家 App，CLI 只显示变更和用户确认指引。
     """
     inner = data.get("data")
     if not isinstance(inner, dict) or not inner.get("staged"):
@@ -125,10 +124,10 @@ def _print_if_staged(data: dict, did: str, pretty: bool) -> bool:
             "category": inner.get("category"),
             "summary": inner.get("summary"),
             "expires_at": inner.get("expires_at"),
-            "confirm_token": inner.get("confirm_token"),
+            "confirmation_channel": inner.get("confirmation_channel"),
             "next": (
-                "受保护设备，服务端未执行。向用户复述 summary 并征得同意；用户确认后执行 "
-                f"miloco-cli device apply {change_id} --token <confirm_token>；"
+                "受保护设备，尚未执行。确认码已推送到用户的米家 App；复述 summary，等待用户同意并提供码后执行 "
+                f"miloco-cli device apply {change_id} --token <用户提供的确认码>；"
                 f"用户拒绝则 miloco-cli device discard {change_id}"
             ),
         },
@@ -139,7 +138,7 @@ def _print_if_staged(data: dict, did: str, pretty: bool) -> bool:
 
 @click.group("device")
 def device_group():
-    """设备操作：列表 / 规格 / 目录 / 控制 / 状态 / 动作 / 刷新缓存 / 待确认变更。"""
+    """设备操作：列表 / 规格 / 目录 / 控制 / 状态 / 动作 / 意图解析 / 刷新缓存 / 待确认变更。"""
 
 
 # ─── device list ─────────────────────────────────────────────────────────────
@@ -573,7 +572,7 @@ def device_changes(pretty):
     "--token",
     "token",
     required=True,
-    help="stage 时输出的 confirm_token（用户确认凭据，一次性）",
+    help="用户从米家 App 确认推送中提供的一次性确认码",
 )
 @click.option("--pretty", is_flag=True)
 def device_apply(change_id, token, pretty):
@@ -597,3 +596,149 @@ def device_discard(change_id, pretty):
     from miloco_cli.client import api_delete
 
     print_result(api_delete(f"/api/miot/changes/{change_id}"), pretty)
+
+
+# ─── device resolve ───────────────────────────────────────────────────────────
+
+
+@device_group.command("resolve")
+@click.option("--room", default=None, help="房间名（用户措辞），可省")
+@click.option("--target", required=True, help="目标设备：设备名 / 类别词，如 灯 / 空调 / 客厅的落地灯")
+@click.option(
+    "--action",
+    type=click.Choice(["set", "get", "call"]),
+    default=None,
+    help="set=控制 / get=查询 / call=动作；省略则按 --property / --value 推断",
+)
+@click.option("--property", "prop", default=None, help="属性 / 动作的用户措辞：温度 / 亮度 / 开 / 关 / 充电 …")
+@click.option(
+    "--value",
+    "values",
+    multiple=True,
+    help="要设置的值 / 动作入参（可重复给多参）；类型自动推断",
+)
+@click.option(
+    "--scope",
+    type=click.Choice(["auto", "single", "all"]),
+    default="auto",
+    show_default=True,
+    help="auto=从 target 识别“所有 / 都”；all=多台全做；single=多台必反问",
+)
+@click.option(
+    "--exec",
+    "do_exec",
+    is_flag=True,
+    default=False,
+    help="ambiguity 为 none 时在本进程内顺序执行 command_preview（一次进程、零次本地 home_info 拉取）",
+)
+@click.option("--pretty", is_flag=True)
+def device_resolve(room, target, action, prop, values, scope, do_exec, pretty):
+    """把“房间 / 目标 / 属性 / 值”解析成可下发的候选设备（后端确定性解析，只解析不下发）。
+
+    \b
+    示例：
+      miloco-cli device resolve --room 卧室 --target 空调 --property 温度 --value 26
+      miloco-cli device resolve --target 所有灯 --property 关 --exec
+      miloco-cli device resolve --target 扫地机 --action call --property 充电
+
+    \b
+    返回 data.ambiguity：none（可执行）/ multiple（反问用户；确认全部则加 --scope all）/
+    not_found（device refresh 后重试一次，禁止编造 did）。data.hint 是下一步指令，
+    data.command_preview 是可直接复制的命令。
+    加 --exec：ambiguity=none 时直接按候选逐台下发，每台一行结果（含 did / code_msg）；
+    否则原样打印解析结果并以退出码 1 结束。
+    """
+    from miloco_cli.client import api_post
+    from miloco_cli.home_info import infer_value
+
+    if not values:
+        value = None
+    elif len(values) == 1:
+        value = infer_value(values[0])
+    else:
+        value = [infer_value(v) for v in values]
+
+    body = {
+        "room": room,
+        "target": target,
+        "action": action,
+        "property": prop,
+        "value": value,
+        "scope": scope,
+    }
+    resp = api_post("/api/miot/intent/resolve", body)
+    data = resp.get("data") if isinstance(resp, dict) else None
+    if not do_exec or not isinstance(data, dict):
+        print_result(resp, pretty)
+        return
+
+    if data.get("ambiguity") != "none":
+        print_result(resp, pretty)
+        print(
+            json.dumps(
+                {"error": f"not executed: ambiguity={data.get('ambiguity')}", "hint": data.get("hint")},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    runnable = [
+        c for c in data.get("candidates", [])
+        if isinstance(c, dict) and not c.get("issue") and c.get("did")
+    ]
+    if not runnable:
+        print_result(resp, pretty)
+        print(
+            json.dumps({"error": "not executed: no runnable candidate", "hint": data.get("hint")}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    for cand in runnable:
+        _exec_resolved(cand, data.get("action") or "set", value, pretty)
+
+
+def _exec_resolved(cand: dict, action: str, value, pretty: bool) -> None:
+    """按后端解析出的候选直接下发：iid 已由后端定好，不再拉 home_info 反查。"""
+    from miloco_cli.client import api_get, api_post
+
+    did = cand["did"]
+    spec = cand.get("spec") or {}
+    iid = spec.get("iid")
+
+    if action == "get":
+        params = {"iid": iid} if iid else None
+        data = api_get(f"/api/miot/devices/{did}/status", params)
+        if isinstance(data.get("data"), dict):
+            data["data"]["did"] = did
+            props = data["data"].get("properties")
+            if isinstance(props, list) and iid and spec.get("spec_name"):
+                for p in props:
+                    if isinstance(p, dict) and p.get("iid") == iid:
+                        p["spec_name"] = spec["spec_name"]
+    elif action == "call":
+        params = value if isinstance(value, list) else ([] if value is None else [value])
+        data = api_post(
+            f"/api/miot/devices/{did}/control",
+            {"type": "call_action", "iid": iid, "params": params},
+        )
+        if isinstance(data.get("data"), dict):
+            data["data"]["did"] = did
+    else:
+        properties = [{"iid": iid, "value": cand.get("value", value)}]
+        needs_on = cand.get("needs_on") or {}
+        if needs_on.get("iid"):
+            properties.append({"iid": needs_on["iid"], "value": True})
+        if len(properties) == 1:
+            body = {"type": "set_property", "iid": properties[0]["iid"], "value": properties[0]["value"]}
+        else:
+            body = {"type": "set_properties", "properties": properties}
+        data = api_post(f"/api/miot/devices/{did}/control", body)
+        if isinstance(data.get("data"), dict):
+            data["data"]["did"] = did
+
+    if _print_if_staged(data, did, pretty):
+        return
+    _annotate_result_codes(data)
+    print_result(data, pretty)

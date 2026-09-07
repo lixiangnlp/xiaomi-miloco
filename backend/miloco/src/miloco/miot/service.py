@@ -33,6 +33,7 @@ from miloco.middleware.exceptions import (
     ResourceNotFoundException,
     ValidationException,
 )
+from miloco.miot import intent as intent_resolver
 from miloco.miot.client import MiotProxy, build_sub_device_names
 from miloco.miot.filter import (
     MAX_CAMERA_PROMPT_LEN,
@@ -70,6 +71,7 @@ from miloco.miot.schema import (
     CameraInfo,
     DeviceControlRequest,
     DeviceInfo,
+    IntentResolveRequest,
     SceneInfo,
 )
 from miloco.utils.time_utils import ms_to_iso_local
@@ -1153,6 +1155,17 @@ class MiotService:
             "spec": spec,
         }
 
+    async def resolve_intent(self, request: IntentResolveRequest) -> dict:
+        """把控制意图解析成候选设备 + spec + 命令预览（只解析、不下发）。
+
+        数据源就是 CLI catalog / device list 用的同一份 home_info（已按启用家庭过滤、
+        spec 走 MiotProxy 的 URN 缓存），解析规则见 :mod:`miloco.miot.intent`。
+        """
+        info = await self.get_home_info()
+        return intent_resolver.resolve_intent(
+            info.get("devices", []), request.model_dump()
+        )
+
     async def control_device(self, did: str, request: DeviceControlRequest) -> dict:
         """Control device: set_property / set_properties / call_action.
 
@@ -1182,8 +1195,8 @@ class MiotService:
     ) -> dict:
         """受保护设备：先做服务端值校验（错参立刻反馈，不占台账），再 stage。
 
-        返回体里的 ``confirm_token`` 是确认凭据。**当前阶段**它随 CLI 输出给到用户
-        侧（CLI 是唯一的用户面），后续 PR 会把凭据改投到 IM / 面板，agent 不再可见。
+        确认凭据只经后端直接投递到米家 App，不进入 API / CLI 响应、台账或日志。
+        投递失败撤销变更；用户从推送中取回一次性码后才能 apply。
         """
         validate_request_against_spec(await _fetch_spec_for(self._miot_proxy, dev), request)
         change = self._changes.stage(
@@ -1193,6 +1206,32 @@ class MiotService:
             device_name=getattr(dev, "name", None),
             room=getattr(dev, "room_name", None),
         )
+        try:
+            # JSON quoting keeps third-party names / values on their own field lines.
+            content = (
+                f"设备操作确认（尚未执行）\n变更：{change.change_id}\n"
+                f"设备：{json.dumps(change.device_name, ensure_ascii=False)} ({did})\n"
+                f"房间：{json.dumps(change.room, ensure_ascii=False)}\n"
+                f"操作：{json.dumps(change.request.model_dump(exclude_none=True), ensure_ascii=False)}\n"
+                f"有效期至：{ms_to_iso_local(change.expires_at_ms)}\n"
+                "仅当您同意以上操作时，将变更编号和确认码回复给助手。\n"
+                f"确认码：{change.confirm_token}"
+            )
+            if not await self._miot_proxy.send_device_confirmation(content):
+                raise BusinessException("confirmation delivery failed")
+            self._changes.get(change.change_id)  # Delivery must finish before expiry.
+        except (Exception, asyncio.CancelledError) as exc:
+            try:
+                self._changes.discard(change.change_id)
+            except ResourceNotFoundException:
+                pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            # Never propagate provider errors or notification content to callers/logs.
+            raise BusinessException(
+                "Confirmation could not be delivered to MiHome; change discarded, "
+                "device not controlled. Check MiHome binding and notifications before retrying."
+            ) from None
         logger.info(
             "device control staged change=%s did=%s category=%s type=%s ttl=%ss",
             change.change_id, did, category, request.type, int(self._changes.ttl_sec),
@@ -1215,11 +1254,12 @@ class MiotService:
             "staged": True,
             **change.public_view(),
             "expires_at": ms_to_iso_local(change.expires_at_ms),
-            "confirm_token": change.confirm_token,
+            "confirmation_channel": "mihome",
             "next": (
-                f"设备属受保护类别 '{change.category}'，未执行。请向用户复述 summary 并"
-                f"征得同意，用户确认后执行 miloco-cli device apply {change.change_id} "
-                "--token <confirm_token>"
+                f"设备属受保护类别 '{change.category}'，未执行。确认码已由后端直接推送到"
+                "用户的米家 App。复述 summary，请用户核对操作并在同意时提供对应确认码；"
+                f"收到用户提供的码后执行 miloco-cli device apply {change.change_id} "
+                "--token <用户提供的确认码>。仅说同意但未提供码不能执行。"
             ),
         }
 
