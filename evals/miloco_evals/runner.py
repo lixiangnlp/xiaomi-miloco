@@ -263,7 +263,8 @@ def run_live(
     import httpx
 
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    session_key = f"agent:main:evals-{case.id}"
+    # One isolated session per run; only turns within this invocation share history.
+    session_key = f"agent:main:evals-{case.id}-{uuid.uuid4().hex}"
     extra = render_state_prompt(case)
     trace_paths: list[Path] = []
     with httpx.Client(timeout=timeout_ms / 1000 + 15.0) as client:

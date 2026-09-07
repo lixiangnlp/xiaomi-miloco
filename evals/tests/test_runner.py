@@ -13,11 +13,48 @@ from miloco_evals.runner import (
     main,
     render_state_prompt,
     replay_cases,
+    run_live,
 )
 from miloco_evals.schema import Case, load_all_cases
 from miloco_evals.scorers import FAIL, PASS, PENDING
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_live_runs_isolate_history_but_share_session_between_turns(tmp_path, monkeypatch):
+    import httpx
+
+    case = Case(
+        id="devices-004-confirmation",
+        skill="miloco-devices",
+        turns=[{"role": "user", "text": "开锁"}, {"role": "user", "text": "确认"}],
+        expected={"max_tool_calls": 4},
+    )
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text('{"hook":"agent_end","payload":{"durationMs":1}}\n')
+    sessions = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        if body["action"] == "agent":
+            sessions.append(body["payload"]["sessionKey"])
+            data = {"runId": str(len(sessions)), "status": "ok"}
+        else:
+            data = {"status": "done", "jsonlPath": trace.name}
+        return httpx.Response(200, json={"code": 0, "data": data})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx, "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    for _ in range(2):
+        run_live(case, webhook_url="https://agent.invalid/webhook", token=None,
+                 miloco_home=tmp_path, out_dir=tmp_path / "recordings", timeout_ms=1000)
+    assert len(sessions) == 4
+    assert sessions[0] == sessions[1]
+    assert sessions[2] == sessions[3]
+    assert sessions[0] != sessions[2]
 
 
 def _cases_dir(tmp_path: Path) -> Path:
