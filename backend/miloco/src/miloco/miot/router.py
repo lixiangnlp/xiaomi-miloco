@@ -299,10 +299,7 @@ async def resolve_intent(
 
     只解析不下发；``ambiguity`` / ``hint`` 告诉调用方（agent）下一步该做什么。
     """
-    logger.info(
-        "Resolve intent API called, user=%s, room=%s, target=%s, action=%s, property=%s",
-        current_user, request.room, request.target, request.action, request.property,
-    )
+    logger.info("Resolve intent API called")
     data = await manager.miot_service.resolve_intent(request)
     return NormalResponse(code=0, message="ok", data=data)
 
@@ -329,9 +326,7 @@ async def apply_change(
     current_user: str = Depends(verify_token),
 ):
     """用户确认后下发：token 一次性；apply 时重查 scope / 重跑值校验。"""
-    logger.info(
-        "Apply change API called, user: %s, change_id: %s", current_user, change_id
-    )
+    logger.info("Apply change API called")
     data = await manager.miot_service.apply_change(change_id, request.confirm_token)
     return NormalResponse(code=0, message="Staged change applied", data=data)
 
@@ -342,9 +337,7 @@ async def apply_change(
     response_model=NormalResponse,
 )
 async def discard_change(change_id: str, current_user: str = Depends(verify_token)):
-    logger.info(
-        "Discard change API called, user: %s, change_id: %s", current_user, change_id
-    )
+    logger.info("Discard change API called")
     data = await manager.miot_service.discard_change(change_id)
     return NormalResponse(code=0, message="Staged change discarded", data=data)
 

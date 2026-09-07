@@ -38,12 +38,12 @@ export function _setSkillsDirOverride(dir: string | undefined): void {
 
 /** 解析某 skill 的 SKILL.md 路径：按候选目录顺序取第一个存在的；都不存在返回 undefined。 */
 export function skillFilePath(name: string): string | undefined {
+  return skillFileCandidates(name).find((file) => fs.existsSync(file));
+}
+
+function skillFileCandidates(name: string): string[] {
   const dirs = skillsDirOverride ? [skillsDirOverride] : SKILLS_DIR_CANDIDATES;
-  for (const dir of dirs) {
-    const file = path.join(dir, name, "SKILL.md");
-    if (fs.existsSync(file)) return file;
-  }
-  return undefined;
+  return dirs.map((dir) => path.join(dir, name, "SKILL.md"));
 }
 
 /** 去掉文件头部的 YAML frontmatter（`---` … `---`）；无 frontmatter 原样返回。 */
@@ -103,7 +103,7 @@ export function estimateTokens(text: string): number {
   return cjk + Math.ceil(other / 4);
 }
 
-type CacheEntry = { file: string; mtimeMs: number; text: string };
+type CacheEntry = { file: string; mtimeMs: number; ino: number; dev: number; text: string };
 const cache = new Map<string, CacheEntry>();
 const warned = new Set<string>();
 
@@ -123,24 +123,36 @@ export function loadSkillBody(
 ): string {
   const key = opts?.sections ? `${name}|${opts.sections.join("")}` : name;
   try {
-    const file = skillFilePath(name);
-    if (!file) {
-      warnOnce(name, `skill ${name} 的 SKILL.md 不存在，预注入回退为指针形态`);
-      return "";
+    for (const file of skillFileCandidates(name)) {
+      let fd: number;
+      try {
+        fd = fs.openSync(file, "r");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
+      }
+      try {
+        // Stat and read the same open file, even if deployment replaces its path.
+        const { mtimeMs, ino, dev } = fs.fstatSync(fd);
+        const hit = cache.get(key);
+        if (hit && hit.file === file && hit.mtimeMs === mtimeMs && hit.ino === ino && hit.dev === dev) {
+          return hit.text;
+        }
+        const body = stripFrontmatter(fs.readFileSync(fd, "utf8")).trim();
+        const text = opts?.sections ? extractSections(body, opts.sections) : body;
+        if (!text) {
+          warnOnce(name, `skill ${name} 正文为空或未匹配到指定小节，预注入回退为指针形态`);
+        } else {
+          warned.delete(name);
+        }
+        cache.set(key, { file, mtimeMs, ino, dev, text });
+        return text;
+      } finally {
+        fs.closeSync(fd);
+      }
     }
-    const mtimeMs = fs.statSync(file).mtimeMs;
-    const hit = cache.get(key);
-    if (hit && hit.file === file && hit.mtimeMs === mtimeMs) return hit.text;
-
-    const body = stripFrontmatter(fs.readFileSync(file, "utf8")).trim();
-    const text = opts?.sections ? extractSections(body, opts.sections) : body;
-    if (!text) {
-      warnOnce(name, `skill ${name} 正文为空或未匹配到指定小节，预注入回退为指针形态`);
-    } else {
-      warned.delete(name);
-    }
-    cache.set(key, { file, mtimeMs, text });
-    return text;
+    warnOnce(name, `skill ${name} 的 SKILL.md 不存在，预注入回退为指针形态`);
+    return "";
   } catch (err) {
     warnOnce(
       name,

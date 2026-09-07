@@ -498,3 +498,28 @@ def test_partial_excerpt_restores_full_skill_loading(tmp_miloco_home, tmp_path, 
     context = ci.inject_context(session_id="miloco-rule-fixture", user_message="x")["context"]
     assert DEVICES_PRELOADED not in context
     assert "必须先读 `miloco-devices` skill" in context
+
+
+def test_skill_replaced_between_stat_and_read_uses_open_file(tmp_path, monkeypatch, skills_reset):
+    import os
+
+    root = tmp_path / "skills"
+    skill = root / "demo" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("# 原始正文")
+    replacement = tmp_path / "replacement.md"
+    replacement.write_text("# 替换正文")
+    os.utime(skill, (1_700_000_000, 1_700_000_000))
+    os.utime(replacement, (1_700_000_000, 1_700_000_000))
+    ci._set_skills_dir_override(root)
+    real_fstat = os.fstat
+
+    def replace_after_stat(fd):
+        stat = real_fstat(fd)
+        replacement.replace(skill)
+        monkeypatch.setattr(os, "fstat", real_fstat)
+        return stat
+
+    monkeypatch.setattr(os, "fstat", replace_after_stat)
+    assert ci.load_skill_body("demo") == "# 原始正文"
+    assert ci.load_skill_body("demo") == "# 替换正文"

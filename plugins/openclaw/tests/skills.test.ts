@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   _resetSkillCache,
   _setSkillsDirOverride,
@@ -155,6 +155,28 @@ describe("loadSkillBody", () => {
     const t1 = new Date(t0.getTime() + 5_000);
     utimesSync(file, t1, t1);
     expect(loadSkillBody("demo")).toBe("# demo\n\n新版正文");
+  });
+
+  it("路径在 stat 后被替换时仍读取已打开的文件，下次调用读取新文件", () => {
+    const file = writeSkill(root, "demo", "# 原始正文");
+    const replacement = path.join(root, "replacement.md");
+    writeFileSync(replacement, "# 替换正文");
+    const timestamp = new Date(Math.floor(Date.now() / 1000) * 1000);
+    utimesSync(file, timestamp, timestamp);
+    utimesSync(replacement, timestamp, timestamp);
+    const fstat = fs.fstatSync.bind(fs);
+    const spy = vi.spyOn(fs, "fstatSync").mockImplementationOnce((fd) => {
+      const result = fstat(fd);
+      fs.renameSync(replacement, file);
+      return result;
+    });
+    try {
+      expect(loadSkillBody("demo")).toBe("# 原始正文");
+      // Identical mtime on a different inode must not reuse the old cache entry.
+      expect(loadSkillBody("demo")).toBe("# 替换正文");
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("默认解析：能从仓库 plugins/skills/ 源目录读到 miloco-notify（未 sync 也可用）", () => {

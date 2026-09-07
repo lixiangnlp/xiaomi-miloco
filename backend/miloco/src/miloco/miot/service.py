@@ -1224,6 +1224,7 @@ class MiotService:
             try:
                 self._changes.discard(change.change_id)
             except ResourceNotFoundException:
+                # It already expired or was discarded while notification I/O awaited.
                 pass
             if isinstance(exc, asyncio.CancelledError):
                 raise

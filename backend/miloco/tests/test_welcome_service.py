@@ -22,6 +22,17 @@ from miloco.miot import welcome_service as ws
 from miloco.miot.welcome_service import DeviceWelcomeService
 
 
+def test_miot_service_can_be_imported_before_perception():
+    """A cold interpreter must not depend on pytest collection importing perception first."""
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [sys.executable, "-c", "from miloco.miot.service import MiotService"],
+        check=True, capture_output=True, timeout=30,
+    )
+
+
 def _device(did="d1", name="测试设备", room="卧室", home="测试家", home_id="H1",
             model="test.model.x1"):
     return SimpleNamespace(

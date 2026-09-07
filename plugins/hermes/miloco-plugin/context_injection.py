@@ -177,7 +177,7 @@ def estimate_tokens(text: str) -> int:
     return cjk + (other + 3) // 4
 
 
-_skill_cache: Dict[str, Tuple[Path, float, str]] = {}
+_skill_cache: Dict[str, Tuple[Path, int, int, int, str]] = {}
 _skill_warned: set = set()
 
 
@@ -193,22 +193,29 @@ def load_skill_body(name: str, sections: Optional[Sequence[str]] = None) -> str:
     按 mtime 缓存；任何失败返回空串并 warn 一次，绝不抛。"""
     key = f"{name}|{''.join(sections)}" if sections else name
     try:
-        f = skill_file_path(name)
-        if f is None:
-            _warn_once(name, f"skill {name} 的 SKILL.md 不存在，预注入回退为指针形态")
-            return ""
-        mtime = f.stat().st_mtime
-        hit = _skill_cache.get(key)
-        if hit and hit[0] == f and hit[1] == mtime:
-            return hit[2]
-        body = strip_frontmatter(f.read_text(encoding="utf-8")).strip()
-        text = extract_sections(body, sections) if sections else body
-        if not text:
-            _warn_once(name, f"skill {name} 正文为空或未匹配到指定小节，预注入回退为指针形态")
-        else:
-            _skill_warned.discard(name)
-        _skill_cache[key] = (f, mtime, text)
-        return text
+        for root in _skills_dir_candidates():
+            f = root / name / "SKILL.md"
+            try:
+                stream = f.open(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            with stream:
+                # Stat/read the same open file across atomic skill deployments.
+                stat = os.fstat(stream.fileno())
+                fingerprint = (f, stat.st_mtime_ns, stat.st_ino, stat.st_dev)
+                hit = _skill_cache.get(key)
+                if hit and hit[:4] == fingerprint:
+                    return hit[4]
+                body = strip_frontmatter(stream.read()).strip()
+                text = extract_sections(body, sections) if sections else body
+                if not text:
+                    _warn_once(name, f"skill {name} 正文为空或未匹配到指定小节，预注入回退为指针形态")
+                else:
+                    _skill_warned.discard(name)
+                _skill_cache[key] = (*fingerprint, text)
+                return text
+        _warn_once(name, f"skill {name} 的 SKILL.md 不存在，预注入回退为指针形态")
+        return ""
     except Exception as exc:  # noqa: BLE001 - 预注入失败只降级
         _warn_once(name, f"读取 skill {name} 失败，预注入回退为指针形态：{exc}")
         return ""

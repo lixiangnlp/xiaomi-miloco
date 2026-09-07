@@ -26,8 +26,6 @@ from miot.types import MIoTDeviceInfo
 
 from miloco.dispatch import dispatch_event, join_text_blocks
 from miloco.miot.mips_listeners import BIND_DEBOUNCE_SEC, META_DEBOUNCE_SEC
-from miloco.perception.event_text_builder import oneline
-from miloco.perception.fence import fence
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +137,11 @@ class DeviceWelcomeService:
         ``<perception_data>`` 围栏（与感知消息同一标签、同一句 prompt 契约），指令本身是
         静态模板。
         """
+        # perception.__init__ imports camera_adapter -> MiotProxy. Defer this
+        # dependency until MiotProxy (which imports this service) has initialized.
+        from miloco.perception.event_text_builder import oneline
+        from miloco.perception.fence import fence
+
         room = oneline(dev.room_name) or "未知房间"
         name = oneline(dev.name) or "未知设备"
         home = oneline(dev.home_name) or "未知家庭"
