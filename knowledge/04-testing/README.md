@@ -5,7 +5,7 @@
 
 ## 已有文档
 
-- [Agent 行为评测（evals）](agent-evals.md)：快照用例形状、code scorer 一览、正负成对规则、录制 / 回放 / baseline 流程；用例目录与社区场景转写见 `evals/cases/README.md`。
+- [Agent 行为评测（evals）](agent-evals.md)：快照用例形状、code scorer 一览、正负成对规则、录制 / 回放 / baseline 流程与 CI 门禁；用例目录与社区场景转写见 `evals/cases/README.md`。
 
 ## 存放内容
 

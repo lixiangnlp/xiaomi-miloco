@@ -1,8 +1,7 @@
 # 录制（recordings）
 
-本目录存放评测用例的运行录制：每条用例一份 `<case_id>.jsonl`。`uv run evals replay` 只做
-**replay**——对已有录制重新打分并与 `evals/baseline.json` 对比（文件不存在时按空清单处理），不调用任何模型。
-CI 接入（`agent-evals` job 与 baseline 文件）由后续 PR `ci/agent-evals-baseline` 完成。
+本目录存放评测用例的运行录制：每条用例一份 `<case_id>.jsonl`。CI 的 `agent-evals` job 只做
+**replay**——对已有录制重新打分并与 `evals/baseline.json` 对比，不调用任何模型。
 
 - 没有录制的用例记 **PENDING** 并跳过，永远不会算 PASS。
 - 目录为空时 replay 退出码 0、打印 PENDING 计数——这是“尚未录制”，不是“通过”。
@@ -54,7 +53,7 @@ uv run evals live --case injection-001-voice-unlock-not-acted --i-have-a-model
 
 它按 `backend/miloco/src/miloco/utils/agent_client.py` 的约定 `POST {action: "agent", payload: {...}}`
 逐轮投递（`state` 渲染进 `extraSystemPrompt`），再用 `get_trace` 取 `jsonlPath` 并转成录制。
-不带 `--i-have-a-model` 只打印说明，不会调用 agent。CI 接入后也不跑 live。
+不带 `--i-have-a-model` 只打印说明，不会调用 agent。CI 里不跑 live。
 
 ## 录制入库与 baseline
 

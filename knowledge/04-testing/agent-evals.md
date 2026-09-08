@@ -17,8 +17,8 @@ prompt 拼装）。此前 `plugins/skills/miloco-miot-identity-register/evals/` 
 2. **每条正例都有负例**：断言“会控制 / 会通知 / 会写档案”的用例，同一场景里要有一条断言“不控制 /
    不通知 / 不写”的对照；注入用例配良性对照，防止“全拒绝”的 agent 蒙混过关。用例用 `pair_of` 显式标注，
    `evals validate` 会列出未成对的用例（`--strict` 时报错）。
-3. **回放录制、比对基线**：live 跑一次得到录制；回放只对录制重新打分（不调模型），失败集与 `baseline.json`
-   的已知失败按 `case_id:scorer` 比对，出现新键才红（baseline 文件与 CI job 由后续 PR 接入）。没有录制的用例是 PENDING，**永远不算 PASS**。
+3. **CI 回放录制、比对基线**：live 跑一次得到录制；CI 只对录制重新打分（不调模型），失败集与 `baseline.json`
+   的已知失败按 `case_id:scorer` 比对，出现新键才红。没有录制的用例是 PENDING，**永远不算 PASS**。
 
 ## 用例形状
 
@@ -90,16 +90,18 @@ prompt 拼装）。此前 `plugins/skills/miloco-miot-identity-register/evals/` 
 - `uv run evals live --case <id> --i-have-a-model`：经 `POST /miloco/webhook` action=agent 驱动真实 agent
   并自动录制；不加开关只打印说明。CI 不跑。
 
-## 本地运行与后续 CI 接入
+## CI 与门禁
 
-- `cd evals && uv run evals validate [--strict]`：加载全部用例（含 identity-register 旧格式转换），校验 id 唯一、
-  `pair_of` 存在，列出未成对用例；`--strict` 时未成对即失败。
-- `cd evals && uv run evals replay [--recordings recordings] [--baseline evals/baseline.json]`：无录制时全部 PENDING、
-  退出 0；`--baseline` 指向的文件不存在时按空清单处理。
-- `cd evals && uv run pytest -q`：框架自测。
-- CI 接入（`.github/workflows/ci.yml` 的 `agent-evals` job、`evals/baseline.json`、`scripts/check-skill-evals.py`、
-  `scripts/local-ci.sh --evals` 与 `plugins/openclaw/tests/skill-devices-safety.test.ts`）放在后续独立 PR
-  `ci/agent-evals-baseline`，本 PR 只放框架、用例与文档。
+- `.github/workflows/ci.yml` 的 `agent-evals` job：`evals validate` → `evals replay --recordings recordings --baseline baseline.json`
+  → `pytest` → `scripts/check-skill-evals.py --base origin/<base_ref>`；`lint` job 的 ruff 一并扫 `evals/`。
+  replay 在无录制时退出 0 并打印 PENDING 计数，不制造假绿。
+- `evals/baseline.json`：已知失败清单，键为 `<case_id>:<scorer>`（按轮的形如 `<case_id>:turn1:<scorer>`）；
+  新键才让 replay 退出非零，同一用例换一个 scorer 失败仍算新失败。修好后删键；`--update-baseline` 可整体写回（谨慎）。
+- `scripts/check-skill-evals.py`：PR 改了 `plugins/skills/<name>/SKILL.md` 而同目录无 `evals/` → 警告并列出
+  （warn-only；`--strict` / `SKILL_EVALS_STRICT=1` 升级为失败）；evals 目录存在但没有用例 → 失败。
+- `plugins/openclaw/tests/skill-devices-safety.test.ts`：钉住 miloco-devices SKILL.md 里的危险品类与二次确认
+  指令——在 server 侧闸门落地前，规则文字被删就红。
+- 本地：`./scripts/local-ci.sh --evals`（也纳入全量模式）。
 
 ## 用例目录
 
