@@ -4,7 +4,7 @@ description: 查询与控制米家智能家居设备。查询能力包括设备�
 metadata:
   author: miloco
   version: "1.8"
-  date: "2026-09-07"
+  date: "2026-09-08"
   openclaw:
     requires:
       bins: ["miloco-cli"]
@@ -58,7 +58,8 @@ miloco-cli device resolve [--room <房间>] --target <设备名或类别词> [--
 
 - 多条互不依赖的 resolve **不要**用 `;` 串——每条的 `ambiguity` 都要单独看；同一条消息里一次性发出全部调用即可。
 - **感知事件触发 → 用事件“来自：房间”作 `--room`**。⚠️ 事件里 `did=` 是来源设备（摄像头 / 传感器），不是要控制的目标。
-- 返回体 `data`：`candidates[]`（did / name / room / online / `spec.spec_name` / `needs_on` / `protected` / `issue`）、`ambiguity`、`hint`、`command_preview[]`。**`hint` 是给你的下一步指令，照做。**
+- 返回体 `data`：`candidates[]`（did / name / room / online / `matched_by` / `spec.spec_name` / `needs_on` / `protected` / `issue`）、`ambiguity`、`hint`、`command_preview[]`。**`hint` 是给你的下一步指令，照做。**
+- **“灯”可能落在开关类设备上**（米家把智能通断器 / 墙壁开关 / 插座也归到灯光类）：resolve 会把同范围内可能控灯的开关以 `matched_by: light-control-fallback` 列进 `candidates`，但**不进 `command_preview`**——是不是灯只有用户知道，以返回的 `hint` 为准反问，用户确认后用 `--target <设备名>` 重试。
 
 ### 步骤 3 · 按 `ambiguity` 处理
 
@@ -66,6 +67,7 @@ miloco-cli device resolve [--room <房间>] --target <设备名或类别词> [--
 | --------- | ---- | ---- |
 | `none` | 命中且唯一，或用户明确“全部”→ 多台全做 | 进入步骤 4；`command_preview` 已是可下发命令 |
 | `multiple` | 命中多台，用户没说“全部” | **反问“哪个房间 / 哪一台”**（候选名和房间在 `candidates` 里），不默认选一台、也不擅自全做；用户回答房间 → 加 `--room` 重试；用户说“都 / 全部” → 加 `--scope all` 重试 |
+| `unconfirmed` | 没有灯类设备，只有“可能控灯”的开关 / 插座（`matched_by: light-control-fallback`） | **反问“是指 X 开关吗”**，不擅自下发；用户确认 → `--target <设备名>` 重试（点名即直接命中） |
 | `not_found` | 没有匹配设备 | `miloco-cli device refresh` 后**同参数重试一次**；仍无 → 回“没找到”，**禁止编造 did**。`hint` 若列出已知房间名，先核对房间叫法 |
 
 - 候选带 `issue`（值越界 / 枚举非法 / 该设备无此可写属性 / spec 为空）→ 该台不会出现在 `command_preview`：按 `issue` 文案改对值重试（枚举可选值、`[min,max;step] 单位` 都在里面），或告知用户该设备不支持。
@@ -168,6 +170,7 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 | ---- | ---- | ---- |
 | `ambiguity: not_found` | `device refresh` → 同参数重试一次 | “没找到，正在刷新…” |
 | `ambiguity: multiple` | 按 `candidates` 列候选追问；用户明确全部 → `--scope all` | “找到 N 个，哪个？” |
+| `ambiguity: unconfirmed` | 只有可能控灯的开关 → 追问是否指它；确认后 `--target <设备名>` 重试 | “没找到灯，是指{开关名}吗？” |
 | 候选 `issue` 值越界 | `issue` 给出 `[min,max;step] 单位` → 按范围改对重试 | “亮度范围1-100” |
 | 候选 `issue` 枚举非法 | `issue` 列出全部可选值 → 挑对的重试 | “风速可选 自动/1-3 档” |
 | 候选 `issue` 无此属性 | 见“何时仍需 device spec”；确无 → 告知不支持 | “{设备名}不支持调{属性}” |
@@ -198,6 +201,7 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 | “关客厅灯”（客厅仅一盏灯） | `device resolve --room 客厅 --target 灯 --property 关 --exec` | `device control 4912 --set on false` |
 | “所有灯关掉” | `device resolve --target 所有灯 --property 关 --exec` | 全屋灯逐台下发，名叫“灯”的传感器不会混入 |
 | “把灯调暗一点”（全屋多盏、未指房间、没说全部） | `device resolve --target 灯 --property 亮度` | `ambiguity: multiple` → 反问“哪个房间的灯？” |
+| “开书房的灯”（书房没有灯类设备，只有一个墙壁开关） | `device resolve --room 书房 --target 灯 --property 开` | `ambiguity: unconfirmed`，候选 `书房开关 (light-control-fallback)` → 反问“书房没有灯，是指书房开关吗？”；确认后 `device resolve --target 书房开关 --property 开 --exec` |
 | “空调设定的温度”（查询） | `device resolve --target 空调 --action get --property 设定温度` | `device props 4962 target-temperature` → 26 |
 | “客厅多少度”（环境数据） | `device resolve --room 客厅 --target 温湿度传感器 --action get --property 温度` | `device props ht01 temperature` → 24.5 |
 | “扫地机回去充电”（动作） | `device resolve --target 扫地机 --action call --property 充电 --exec` | `device action 4981 start-charge` |

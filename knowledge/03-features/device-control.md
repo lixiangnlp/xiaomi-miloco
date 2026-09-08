@@ -90,13 +90,13 @@ MiOT SDK 顶层客户端，聚合 Cloud、LAN、mDNS、MQTT、摄像头等子模
 **解析规则**（全在 `miot/intent.py`，纯函数、无 I/O，数据源是与 catalog / `device list` 相同的 `get_home_info`）：
 
 1. 房间：精确匹配 → 包含匹配；`room` 为空时尝试从 `target` 前缀拆出已知房间名。
-2. 目标：整词是类别词（`INTENT_SYNONYMS`，中英文同义词表，种子来自 `whitelist.json` 的类别列）→ 按 category 选（名叫“灯”的传感器不会混进“所有灯”）；否则精确设备名 → 名字互含 → 子设备别名 → 文本含类别词。
+2. 目标：整词是类别词（`INTENT_SYNONYMS`，中英文同义词表，种子来自 `whitelist.json` 的类别列）→ 按 category 选（名叫“灯”的传感器不会混进“所有灯”）；否则精确设备名 → 名字互含 → 子设备别名 → 文本含类别词。用户说的是“灯”这个类别词时（上游 issue #36：米家把通断器 / 墙壁开关 / 插座也归到灯光类），同范围内 category 为 `switch` / `outlet` / `controller-panel`（`LIGHT_CONTROL_FALLBACK_CATEGORIES`）且带可写 bool `on` 的设备也列为候选，`matched_by: light-control-fallback`；它们永不进 `command_preview`，只由 `hint` 提示 Agent 反问；用户点名设备（按名字命中）时不触发。
 3. 属性 / 动作：`PROPERTY_SYNONYMS` / `ACTION_SYNONYMS` 同义词表 → spec description 子串兜底；查询（get）优先只读传感读数（“温度”→ `temperature` 而非 `target-temperature`）；同 type_name 多条（`on@空调` / `on@指示灯`）按“属性所在 service → service_type_name == category → iid 序”选，spec_name 带 `@模块` 后缀的规则与 CLI catalog 一致（`resolve_spec_keys`）。
 4. 值：bool 归一（含中文开 / 关）、字符串转数字、枚举名映射到枚举值；枚举 / 范围校验与 CLI `home_info.validate_value` 同口径，不合法则写入候选的 `issue` 而不是抛错。
 5. 补开关：控制非 on 属性且设备有可写 `on` → `needs_on` 给出与本次属性同 service 的开关 spec_name + iid；厨房电器（`KITCHEN_CATEGORIES`）不补。
 6. `protected`：门锁 / 摄像头 / 燃气阀 / 烟感等安全类别只打标记，二次确认由 Skill 流程执行。
 
-**输出**：`candidates[]`（did / name / room / category / online / 紧凑 `spec` / `needs_on` / `protected` / `issue`）、`ambiguity`（`none` / `multiple` / `not_found`）、`hint`（给 Agent 的下一步指令，如“命中 3 台；用户未说‘全部’，请反问房间 / 哪一台”“可 device refresh 后重试；禁止编造 did”）、`command_preview[]`（可原样执行的 `miloco-cli` 命令）。多候选而用户未说“全部”时不擅自决定，`scope=all` 才全做。
+**输出**：`candidates[]`（did / name / room / category / online / `matched_by` / 紧凑 `spec` / `needs_on` / `protected` / `issue`）、`ambiguity`（`none` / `multiple` / `unconfirmed`——只有可能控灯的开关类候选、须用户确认 / `not_found`）、`hint`（给 Agent 的下一步指令，如“命中 3 台；用户未说‘全部’，请反问房间 / 哪一台”“可 device refresh 后重试；禁止编造 did”）、`command_preview[]`（可原样执行的 `miloco-cli` 命令）。多候选而用户未说“全部”时不擅自决定，`scope=all` 才全做。
 
 **CLI**：`miloco-cli device resolve --room 卧室 --target 空调 --property 温度 --value 26 [--scope all] [--exec]`。`--exec` 在 `ambiguity == none` 时于同一进程内顺序下发全部候选（iid 由后端给出，不再拉 home_info），每台一行带 `did` / `code_msg` 的结果；否则打印解析结果并以退出码 1 结束。
 
@@ -139,7 +139,7 @@ Scope 定义了"Miloco 管控哪些设备"的边界，分为两个维度：
 | 修改 scope 过滤逻辑   | `miot/filter.py`                                                                 |
 | 修改 scope CRUD 逻辑  | `miot/service.py`（`switch_home` / `toggle_camera` / `list_cameras_with_state`） |
 | 修改设备控制 API 端点 | `miot/router.py`                                                                 |
-| 修改意图解析规则（同义词 / 补 on / 校验） | `miot/intent.py`（`INTENT_SYNONYMS` / `PROPERTY_SYNONYMS` / `KITCHEN_CATEGORIES` / `PROTECTED_CATEGORIES`） |
+| 修改意图解析规则（同义词 / 补 on / 校验 / 控灯开关回落） | `miot/intent.py`（`INTENT_SYNONYMS` / `PROPERTY_SYNONYMS` / `KITCHEN_CATEGORIES` / `PROTECTED_CATEGORIES` / `LIGHT_CONTROL_FALLBACK_CATEGORIES`） |
 | 修改 MiOT SDK 封装层  | `miot/client.py`（MiotProxy），更底层看 `backend/miot/src/miot/`                 |
 | 修改摄像头管理逻辑    | `miot/camera_handler.py`（`CameraVisionHandler`）                                |
 
