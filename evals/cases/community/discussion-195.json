@@ -1,0 +1,223 @@
+{
+  "_comment": "从上游 discussion #195（官方头脑风暴帖）用户回复转写的真实场景。did / 人名 / 房间全部是占位夹具（wm_01 洗衣机、spk_01/spk_02 音箱、4912/4945 灯、cam_* 摄像头），不对应任何真实家庭。转写方法与挑选标准见 evals/cases/README.md。",
+  "cases": [
+    {
+      "id": "community-001-laundry-done-resident-home-tts",
+      "skill": "miloco-notify",
+      "priority": "high",
+      "difficulty": "medium",
+      "tags": [
+        "community",
+        "discussion-195",
+        "notify",
+        "positive",
+        "L3"
+      ],
+      "pair_of": "community-002-laundry-done-nobody-home-im",
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\nwm_01|阳台洗衣机|阳台|washer|online\n---\non|wr|bool\n\n\nspk_01|客厅音箱|客厅|speaker|online\nspk_02|卧室音箱|卧室|speaker|online\n---\nplay-text|x|text-content:string",
+        "perception_log": "18:40 客厅 张伟坐在沙发上看电视",
+        "home_profile_entries": [
+          {
+            "type": "member_persona",
+            "subject_name": "张伟",
+            "content": "住户，工作日 18:00 左右到家"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "role": "system_event",
+          "text": "[感知引擎]规则提醒：\n时间：18:45:00\n来源：阳台的阳台摄像头(did=cam_balcony)\n画面描述：洗衣机面板显示洗涤完成，舱门仍关着\n触发条件：洗衣机洗完后是否有人取衣服\n触发原因：洗衣机 18:35 洗涤完成，10 分钟内没人打开舱门\n\n**意图**：\n提醒住户去取衣服。"
+        }
+      ],
+      "expected": {
+        "notify_sent": true,
+        "notify_level": "L3",
+        "notify_channels": [
+          "tts"
+        ],
+        "calls_cli": [
+          "device action spk_01 play-text"
+        ],
+        "never_calls_cli": [
+          "device action spk_02 play-text",
+          "notify push",
+          "device (control|action) wm_01"
+        ],
+        "never_calls_tool": [
+          "miloco_im_push"
+        ]
+      },
+      "notes": "来源：discussion #195 · @zhanghaojia668“衣服洗完了没开门取衣服、摄像头看到我在家，就播报提醒取衣服”。miloco-notify SKILL.md：任务完成类提醒是 L3；接收人所在房间（客厅）有在线音箱 → 只该房间 TTS（spk_01），不用卧室音箱、不发 IM、不走米家推送；洗衣机本身不动。"
+    },
+    {
+      "id": "community-002-laundry-done-nobody-home-im",
+      "skill": "miloco-notify",
+      "priority": "high",
+      "difficulty": "medium",
+      "tags": [
+        "community",
+        "discussion-195",
+        "notify",
+        "negative",
+        "L3"
+      ],
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\nwm_01|阳台洗衣机|阳台|washer|online\n---\non|wr|bool\n\n\nspk_01|客厅音箱|客厅|speaker|online\nspk_02|卧室音箱|卧室|speaker|online\n---\nplay-text|x|text-content:string",
+        "perception_log": "17:50 玄关 张伟出门\n18:40 全屋 无人",
+        "home_profile_entries": [
+          {
+            "type": "member_persona",
+            "subject_name": "张伟",
+            "content": "住户，工作日 18:00 左右到家"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "role": "system_event",
+          "text": "[感知引擎]规则提醒：\n时间：18:45:00\n来源：阳台的阳台摄像头(did=cam_balcony)\n画面描述：洗衣机面板显示洗涤完成，舱门仍关着\n触发条件：洗衣机洗完后是否有人取衣服\n触发原因：洗衣机 18:35 洗涤完成，10 分钟内没人打开舱门\n\n**意图**：\n提醒住户去取衣服。"
+        }
+      ],
+      "expected": {
+        "notify_sent": true,
+        "notify_level": "L3",
+        "notify_channels": [
+          "im"
+        ],
+        "calls_tool": [
+          "miloco_im_push"
+        ],
+        "never_calls_cli": [
+          "play-text",
+          "notify push",
+          "device (control|action) wm_01"
+        ]
+      },
+      "notes": "对照：同一事件但确认全家无人 → 不对空房间播报（miloco-notify 重要原则 2），L3 降级为 IM，仍不走米家推送。一个“有事就播报”的 agent 会在这条上失败；一个“没人就不通知”的 agent 也会失败（衣服还是要取）。"
+    },
+    {
+      "id": "community-003-bedtime-routine-asks-before-acting",
+      "skill": "miloco-devices",
+      "priority": "high",
+      "difficulty": "hard",
+      "tags": [
+        "community",
+        "discussion-195",
+        "control",
+        "positive",
+        "proactive"
+      ],
+      "pair_of": "community-004-bedtime-explicit-request-controls",
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\n4912|客厅吸顶灯|客厅|light|online\n4945|卧室吸顶灯|卧室|light|online\n---\non|wr|bool\n\n\nspk_01|客厅音箱|客厅|speaker|online\n---\nplay-text|x|text-content:string",
+        "perception_log": "21:05 客厅 张伟坐在沙发上看手机",
+        "home_profile_entries": [
+          {
+            "type": "member_routine",
+            "subject_name": "张伟",
+            "content": "通常 21:00 后关灯准备休息"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "role": "system_event",
+          "text": "[感知引擎]规则提醒：\n时间：21:05:00\n来源：客厅的客厅摄像头(did=cam_001)\n画面描述：张伟坐在沙发上看手机，客厅灯亮着\n触发条件：21 点后住户在家且灯还亮着\n触发原因：已过 21:00，张伟在客厅，客厅灯与卧室灯仍开着，住户没有操作\n\n**意图**：\n询问住户要不要现在关灯休息。"
+        },
+        {
+          "role": "user",
+          "text": "好，关吧"
+        }
+      ],
+      "turn_expected": {
+        "1": {
+          "device_not_controlled": [
+            {
+              "did": "4912"
+            },
+            {
+              "did": "4945"
+            }
+          ],
+          "never_calls_cli": [
+            "device control",
+            "notify push"
+          ],
+          "notify_sent": true,
+          "notify_channels": [
+            "tts"
+          ],
+          "calls_cli": [
+            "device action spk_01 play-text"
+          ]
+        },
+        "2": {
+          "device_controlled": [
+            {
+              "did": "4912",
+              "spec_name": "on",
+              "value": "false"
+            },
+            {
+              "did": "4945",
+              "spec_name": "on",
+              "value": "false"
+            }
+          ],
+          "never_calls_cli": [
+            "notify push"
+          ]
+        }
+      },
+      "notes": "来源：discussion #195 · @buzhangsan“每天 9 点后关灯……某天我在家但没操作，小爱问我要不要这样操作”。住户在场且没有动手 → 第 1 轮只在住户所在房间用音箱问一句（L3，不推送），任何灯都不动；第 2 轮住户同意后才 device control 关灯。原场景里的“播放安眠曲”现有 scorer 钉不住（无对应 spec 夹具），不作断言。"
+    },
+    {
+      "id": "community-004-bedtime-explicit-request-controls",
+      "skill": "miloco-devices",
+      "priority": "high",
+      "difficulty": "easy",
+      "tags": [
+        "community",
+        "discussion-195",
+        "control",
+        "negative"
+      ],
+      "state": {
+        "catalog_snapshot": "# devices catalog\n# 数据格式：did|device_name|room|category|status\n4912|客厅吸顶灯|客厅|light|online\n4945|卧室吸顶灯|卧室|light|online\n---\non|wr|bool\n\n\nspk_01|客厅音箱|客厅|speaker|online\n---\nplay-text|x|text-content:string",
+        "perception_log": "21:05 客厅 张伟坐在沙发上看手机"
+      },
+      "turns": [
+        {
+          "role": "user",
+          "text": "我要睡了，客厅和卧室的灯都关了"
+        }
+      ],
+      "expected": {
+        "device_controlled": [
+          {
+            "did": "4912",
+            "spec_name": "on",
+            "value": "false"
+          },
+          {
+            "did": "4945",
+            "spec_name": "on",
+            "value": "false"
+          }
+        ],
+        "asks_confirmation": false,
+        "never_calls_cli": [
+          "play-text",
+          "notify push"
+        ],
+        "never_calls_tool": [
+          "miloco_im_push"
+        ],
+        "max_tool_calls": 4
+      },
+      "notes": "对照：住户明确下令 → 直接关灯，不反问、不再用音箱“确认一下”、不发通知。防止 community-003 的“先问再做”被泛化到普通指令上。"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "skill_name": "miloco-miot-identity-register",
-  "_design_note": "expectations 按 grader.md 'discriminating' 标准设计: 每条失败时能识别真问题(参数错/字段缺/反模式触发), 不仅检查'用了什么命令'。负面检查(不含某关键词)与正面检查(必须含某字段)并重。",
+  "_design_note": "expectations 按 knowledge/04-testing/agent-evals.md 的 discriminating 标准设计: 每条失败时能识别真问题(参数错/字段缺/反模式触发), 不仅检查'用了什么命令'。负面检查(不含某关键词)与正面检查(必须含某字段)并重。本文件由 evals/miloco_evals/legacy.py 转换成可回放用例(expectations 整体进 rubric, “不含 `xxx`” 一类否定句抽成 never_calls_cli), 运行方式见 knowledge/04-testing/agent-evals.md。",
   "evals": [
     {
       "id": 1,
