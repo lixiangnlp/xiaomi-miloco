@@ -1506,8 +1506,8 @@ class RuleRunner:
         # Execute. 规则静态动作与 CLI / web 走同一个 execute_control(显式调用,镜像
         # 上面 _trigger_scene 的复用方式):受保护类别闸门、服务端值校验、action_ledger
         # (source=rule / source_id=rule_id)都在里面定义一次,这里不再另写一套。
-        # 受保护设备的策略取 safety.rule_protected:deny(默认,无人可确认 → 拒绝并落
-        # 台账)/ allow(规则是住户显式配置 → 放行,台账行 protected=1 可检索)。
+        # 受保护设备的策略取 safety.rule_protected:allow(默认,规则是住户显式配置的授权
+        # → 放行,台账行 protected=1 可检索)/ deny(拒绝并落 rejected 台账,供想收紧的家庭)。
         from miloco.config import get_settings
         from miloco.middleware.exceptions import ValidationException
         from miloco.miot.schema import DeviceControlRequest

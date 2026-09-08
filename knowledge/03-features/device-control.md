@@ -110,7 +110,7 @@ Scope 定义了"Miloco 管控哪些设备"的边界，分为两个维度：
 
 设备属性写入 / 查询 / 动作调用统一经 `MiotProxy` → `MIoTClient.http_client`（`MIoTHttpClient`，`backend/miot/src/miot/cloud.py`）发往小米云 HTTP API——不走局域网直连。`MIoTClient` 内的 LAN（`backend/miot/src/miot/lan.py`）/ mDNS 子模块用于局域网设备发现与在线状态维护，摄像头实时画面走 PPCS 串流（见 [live-camera-view](live-camera-view.md)），均不承载控制写入。SDK 各路径能力见 [sdk-miot.md](../05-external-deps/sdk-miot.md)。
 
-**STATIC 规则为什么也走 execute_control**：早期规则路径直接调 `MiotProxy`，理由是 scope 校验冗余、追求低延迟。但“危险设备需二次确认”“值必须在 spec 范围内”这些规则若只在 CLI / Skill 文案里存在，规则路径就成了绕过点。现在闸门与校验定义在 `execute_control` 一处，规则路径显式调用同一个函数（与它复用 `_write_action_ledger` / `_trigger_scene` 的方式一致），scope 校验仍留在 `MiotService` 层不重复。spec 按 urn 内存缓存，额外开销可忽略。规则命中受保护类别时的策略由 `safety.rule_protected` 决定：`deny`（默认）拒绝并落 `status=rejected` 台账，`allow` 放行但台账行 `protected=1`。
+**STATIC 规则为什么也走 execute_control**：早期规则路径直接调 `MiotProxy`，理由是 scope 校验冗余、追求低延迟。但“危险设备需二次确认”“值必须在 spec 范围内”这些规则若只在 CLI / Skill 文案里存在，规则路径就成了绕过点。现在闸门与校验定义在 `execute_control` 一处，规则路径显式调用同一个函数（与它复用 `_write_action_ledger` / `_trigger_scene` 的方式一致），scope 校验仍留在 `MiotService` 层不重复。spec 按 urn 内存缓存，额外开销可忽略。规则命中受保护类别时的策略由 `safety.rule_protected` 决定：`allow`（默认）放行执行但台账行 `protected=1`——规则是住户显式配置的授权，默认拒绝会让既有“人离开 → 关摄像头”类规则升级后静默失效；`deny` 拒绝并落 `status=rejected` 台账，供想收紧的家庭。
 
 #### 危险设备闸门（stage / apply）
 

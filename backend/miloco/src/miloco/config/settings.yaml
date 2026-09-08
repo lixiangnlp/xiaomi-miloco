@@ -65,7 +65,7 @@ notify:
 safety:
   protected_categories: ["lock", "camera", "video-doorbell", "gas-valve", "gas-sensor", "smoke-sensor"]
   stage_ttl_sec: 600     # 待确认变更有效期（秒），进程重启即作废
-  rule_protected: deny   # 规则静态动作命中受保护类别：deny=拒绝并落台账 / allow=放行且台账 protected=1
+  rule_protected: allow  # 规则静态动作命中受保护类别：allow=放行且台账 protected=1（默认）/ deny=拒绝并落 rejected 台账
 
 # 摄像头采集参数
 camera:

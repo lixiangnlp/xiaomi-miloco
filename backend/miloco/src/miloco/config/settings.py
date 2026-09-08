@@ -274,10 +274,10 @@ class SafetySettings(BaseModel):
         description="待确认变更的有效期（秒），过期后需重新发起；最小 1 秒",
     )
     rule_protected: Literal["deny", "allow"] = Field(
-        default="deny",
+        default="allow",
         description=(
-            "规则引擎静态动作命中受保护类别时的策略：deny=拒绝并落台账（默认，"
-            "无人可确认）；allow=放行执行，台账行 source=rule 且 protected=1"
+            "规则引擎静态动作命中受保护类别时的策略：allow=放行执行（默认，规则是住户"
+            "显式配置的授权），台账行 source=rule 且 protected=1；deny=拒绝并落 rejected 台账"
         ),
     )
 

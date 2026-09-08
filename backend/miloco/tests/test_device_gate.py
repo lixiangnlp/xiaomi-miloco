@@ -534,13 +534,14 @@ def _make_runner(proxy):
 async def test_rule_runner_static_action_goes_through_gate(tmp_path, store, monkeypatch):
     from miloco.rule.schema import RuleAction
 
+    # 显式收紧为 deny：受保护设备拒绝，不下发，台账留痕 source=rule
+    monkeypatch.setenv("MILOCO_SAFETY__RULE_PROTECTED", "deny")
     reset_settings()
     proxy = _make_proxy(tmp_path, store)
     runner = _make_runner(proxy)
     spy = AsyncMock()
     monkeypatch.setattr("miloco.miot.service._write_action_ledger", spy)
 
-    # 受保护设备（默认 rule_protected=deny）：拒绝，不下发，台账留痕 source=rule
     protected = RuleAction(did="cam", iid="prop.2.1", value=False, idempotent=False,
                            cooldown_minutes=5)
     res = await runner._execute_action("rule-1", protected)
@@ -566,25 +567,27 @@ async def test_rule_runner_static_action_goes_through_gate(tmp_path, store, monk
     kw = spy.await_args.kwargs
     assert kw["status"] == "applied" and kw["protected"] is False and kw["success"] is True
     assert runner._in_cooldown("rule-1", ok)
+    monkeypatch.delenv("MILOCO_SAFETY__RULE_PROTECTED")
+    reset_settings()
 
 
-async def test_rule_runner_allow_policy_executes_protected(tmp_path, store, monkeypatch):
+async def test_rule_runner_default_allow_executes_protected(tmp_path, store, monkeypatch):
+    """默认 rule_protected=allow：规则是住户显式配置的授权，受保护设备放行但台账 protected=1。"""
     from miloco.rule.schema import RuleAction
 
-    monkeypatch.setenv("MILOCO_SAFETY__RULE_PROTECTED", "allow")
+    monkeypatch.delenv("MILOCO_SAFETY__RULE_PROTECTED", raising=False)
     reset_settings()
-    try:
-        proxy = _make_proxy(tmp_path, store)
-        runner = _make_runner(proxy)
-        spy = AsyncMock()
-        monkeypatch.setattr("miloco.miot.service._write_action_ledger", spy)
-        action = RuleAction(did="cam", iid="prop.2.1", value=False, idempotent=False,
-                            cooldown_minutes=5)
-        res = await runner._execute_action("rule-2", action)
-        assert res.result is True and res.error is None
-        proxy.set_device_properties.assert_awaited_once()
-        kw = spy.await_args.kwargs
-        assert kw["source"] == "rule" and kw["status"] == "applied" and kw["protected"] is True
-    finally:
-        monkeypatch.delenv("MILOCO_SAFETY__RULE_PROTECTED")
-        reset_settings()
+    from miloco.config import get_settings
+
+    assert get_settings().safety.rule_protected == "allow"
+    proxy = _make_proxy(tmp_path, store)
+    runner = _make_runner(proxy)
+    spy = AsyncMock()
+    monkeypatch.setattr("miloco.miot.service._write_action_ledger", spy)
+    action = RuleAction(did="cam", iid="prop.2.1", value=False, idempotent=False,
+                        cooldown_minutes=5)
+    res = await runner._execute_action("rule-2", action)
+    assert res.result is True and res.error is None
+    proxy.set_device_properties.assert_awaited_once()
+    kw = spy.await_args.kwargs
+    assert kw["source"] == "rule" and kw["status"] == "applied" and kw["protected"] is True

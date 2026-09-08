@@ -174,8 +174,8 @@
         "rule_protected": {
           "type": "string",
           "enum": ["deny", "allow"],
-          "default": "deny",
-          "description": "规则引擎静态动作命中受保护类别时的策略：deny=拒绝并落台账；allow=放行执行，台账行 source=rule 且 protected=1"
+          "default": "allow",
+          "description": "规则引擎静态动作命中受保护类别时的策略：allow=放行执行（默认，规则是住户显式配置的授权），台账行 source=rule 且 protected=1；deny=拒绝并落 rejected 台账"
         }
       }
     },
