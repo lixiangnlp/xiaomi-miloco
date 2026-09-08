@@ -10,6 +10,9 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Literal
 
 from miot.types import (
     MIoTActionParam,
@@ -25,6 +28,7 @@ from miloco.config import get_settings
 from miloco.database.kv_repo import ScopeConfigKeys
 from miloco.database.person_repo import PersonRepo
 from miloco.middleware.exceptions import (
+    AuthorizationException,
     BusinessException,
     MiotOAuthException,
     MiotServiceException,
@@ -53,6 +57,13 @@ from miloco.miot.filter import (
     synthetic_camera_did,
     voice_allowed_camera_dids,
 )
+from miloco.miot.gate import (
+    PendingStore,
+    ProtectionDecision,
+    StagedChange,
+    resolve_protection,
+    validate_request_against_spec,
+)
 from miloco.miot.iid import try_parse_iid
 from miloco.miot.lru import LRUStore
 from miloco.miot.message_dedup import MessageDeduper
@@ -65,6 +76,7 @@ from miloco.miot.schema import (
     DeviceInfo,
     SceneInfo,
 )
+from miloco.utils.time_utils import ms_to_iso_local
 
 logger = logging.getLogger(__name__)
 
@@ -145,11 +157,17 @@ async def _write_action_ledger(
     source: str = "cli",
     source_id: str | None = None,
     home_id: str | None = None,
+    status: str = "applied",
+    change_id: str | None = None,
+    protected: bool = False,
 ) -> None:
     """落一行 action_ledger + 打一条 INFO 结果日志。**fail-open**:
 
     ``source`` 区分触发源:``cli``(control_device 路径,含 manual CLI 与 agent-via-CLI,
     后者由 trace_id 区分)/ ``rule``(RuleRunner 直控,``source_id`` 写 rule_id)。
+    ``status`` / ``change_id`` / ``protected`` 是 v5 闸门列(见 ``miot/gate.py`` 与
+    ``metrics_db._ACTION_LEDGER_SCHEMA`` 注释):默认 ``applied`` / NULL / 0,
+    与 v5 之前的所有调用点语义一致。
 
     整体裹 try/except,任何异常只 warning,绝不影响调用方的控制结果。
     device_name / room 从内存 device cache 解析(便宜),解析失败留 None。
@@ -199,14 +217,17 @@ async def _write_action_ledger(
                     source=source,
                     source_id=source_id,
                     home_id=home_id,
+                    status=status,
+                    change_id=change_id,
+                    protected=protected,
                 )
             )
 
         logger.info(
-            "action_ledger device=%s(did=%s room=%s) type=%s iid=%s success=%s "
-            "reason=%s value_len=%d",
-            device_name or "?", did, room or "?", action_type, iid, success,
-            (result_msg or error or "ok"),
+            "action_ledger device=%s(did=%s room=%s) type=%s iid=%s status=%s success=%s "
+            "reason=%s change=%s value_len=%d",
+            device_name or "?", did, room or "?", action_type, iid, status, success,
+            (result_msg or error or "ok"), change_id or "-",
             _truncate_value_len(value_json),
         )
     except Exception as e:  # noqa: BLE001 —— 审计 fail-open,绝不拖垮控制调用
@@ -292,6 +313,173 @@ async def _trigger_scene(
         raise MiotServiceException(f"Failed to trigger scene: {str(e)}") from e
 
 
+def _request_iids(request: DeviceControlRequest) -> list[str]:
+    """控制请求涉及的 iid 列表(LRU touch 用)。"""
+    if request.type == "set_properties":
+        return [p.iid for p in (request.properties or [])]
+    return [request.iid] if request.iid else []
+
+
+async def _resolve_device(miot_proxy: MiotProxy, did: str):
+    """best-effort 从 device / camera cache 取设备信息(闸门与 spec 校验用)。
+
+    取不到返回 None:闸门按“类别未知 = 不受保护”处理、spec 校验跳过——scope
+    校验(``_assert_did_in_allowed_home``)仍会拦住不存在的设备,这里不重复报错。
+    """
+    try:
+        devices = await miot_proxy.get_devices()
+        dev = devices.get(did) if isinstance(devices, dict) else None
+        if dev is None:
+            cameras = await miot_proxy.get_cameras()
+            dev = cameras.get(did) if isinstance(cameras, dict) else None
+        return dev
+    except Exception as e:  # noqa: BLE001 —— cache 解析失败不反噬控制主体
+        logger.warning("resolve device %s for gate failed: %s", did, e)
+        return None
+
+
+async def _fetch_spec_for(miot_proxy: MiotProxy, dev) -> dict | None:
+    """取设备 spec(MiotProxy 按 urn 内存缓存);拉不到返回 None,值校验随之跳过(fail-open)。"""
+    urn = getattr(dev, "urn", None)
+    if not isinstance(urn, str):
+        return None
+    try:
+        spec = await miot_proxy._fetch_device_spec(urn)
+        return spec if isinstance(spec, dict) else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("fetch spec for gate failed (urn=%s): %s", urn, e)
+        return None
+
+
+def current_protection(dev) -> ProtectionDecision:
+    """按 *当前* 配置判定设备是否命中受保护类别。每次调用现读 settings,不是启动快照。"""
+    return resolve_protection(dev, get_settings().safety.protected_categories)
+
+
+@dataclass
+class ControlOutcome:
+    """``execute_control`` 的结果:HTTP 返回体 + 归一后的成功判定。"""
+
+    payload: dict
+    success: bool
+    result_code: int | None
+    result_msg: str | None
+    protected: bool
+
+
+async def execute_control(
+    miot_proxy: MiotProxy,
+    did: str,
+    request: DeviceControlRequest,
+    *,
+    source: str = "cli",
+    source_id: str | None = None,
+    change_id: str | None = None,
+    on_protected: Literal["allow", "deny"] = "allow",
+    summarize: Callable[[object], tuple[bool, int | None, str | None]] = summarize_results,
+) -> ControlOutcome:
+    """设备控制的**唯一**执行核心——闸门与校验定义一次、所有路径共用。
+
+    调用方(都是显式调用,镜像 ``_write_action_ledger`` / ``_trigger_scene`` 的复用方式):
+
+    - ``MiotService.control_device``(CLI / web):受保护设备在进来之前已被 stage,
+      到这里的都是非受保护设备;
+    - ``MiotService.apply_change``(用户确认后的下发):带 ``change_id``,台账 applied
+      行与 stage 行共用同一个 change_id;
+    - ``RuleRunner._execute_action``(规则静态动作):``on_protected`` 取
+      ``safety.rule_protected``——``deny`` 命中受保护类别直接拒绝并落台账;``allow``
+      放行,但台账行 protected=1。
+
+    顺序:iid 解析 → 受保护类别判定 → 服务端值校验(spec 的 value_list / value_range /
+    步进 / writeable / action 入参数量)→ 下发 → 落 action_ledger。闸门 / 校验拒绝抛
+    ``ValidationException`` 并落一行 ``status=rejected``(apply 路径为 ``apply_rejected``)
+    的台账——越权与参数错误是最该留痕的失败;下发异常落 ``status=applied, success=0``
+    后原样抛出。``summarize`` 允许规则路径沿用“空返回 = 失败”的严格口径。
+    """
+    attempted_value_json = _request_value_json(request)
+    ledger_iid = _request_iid(request)
+    reject_status = "apply_rejected" if change_id else "rejected"
+
+    # 1. iid 形态解析(调用方 bug → 422,不落台账,与 v5 之前的 control_device 一致)
+    prop_params: list[MIoTSetPropertyParam] = []
+    action_param: MIoTActionParam | None = None
+    if request.type == "set_property":
+        if not request.iid:
+            raise ValidationException("iid is required for set_property")
+        siid, piid = _parse_prop_iid(request.iid)
+        prop_params = [
+            MIoTSetPropertyParam(did=did, siid=siid, piid=piid, value=request.value)
+        ]
+    elif request.type == "set_properties":
+        if not request.properties:
+            raise ValidationException("properties is required for set_properties")
+        for prop in request.properties:
+            siid, piid = _parse_prop_iid(prop.iid)
+            prop_params.append(
+                MIoTSetPropertyParam(did=did, siid=siid, piid=piid, value=prop.value)
+            )
+    else:
+        if not request.iid:
+            raise ValidationException("iid is required for call_action")
+        siid, aiid = _parse_action_iid(request.iid)
+        action_param = MIoTActionParam(
+            did=did, siid=siid, aiid=aiid, in_=request.params or []
+        )
+
+    # 2. 受保护类别判定(按当前配置)+ 服务端值校验
+    dev = await _resolve_device(miot_proxy, did)
+    decision = current_protection(dev)
+
+    async def _record(status: str, *, success: bool, error: str | None,
+                      result_code: int | None = None, result_msg: str | None = None) -> None:
+        await _write_action_ledger(
+            miot_proxy,
+            action_type=request.type,
+            did=did, iid=ledger_iid,
+            value_json=attempted_value_json,
+            result_code=result_code, result_msg=result_msg,
+            success=success, error=error,
+            source=source, source_id=source_id,
+            status=status, change_id=change_id, protected=decision.protected,
+        )
+
+    if decision.protected and on_protected == "deny":
+        err = (
+            f"device '{did}' is in {decision.reason}; source '{source}' has no user "
+            "to confirm, so the control is refused (safety.rule_protected=deny)"
+        )
+        await _record(reject_status, success=False, error=f"gate: {err}")
+        raise ValidationException(err)
+    try:
+        validate_request_against_spec(await _fetch_spec_for(miot_proxy, dev), request)
+    except ValidationException as e:
+        await _record(reject_status, success=False, error=f"gate: {e.message}")
+        raise
+
+    # 3. 下发 + 台账(成功 / 异常两路都落)
+    try:
+        if action_param is not None:
+            result = await miot_proxy.call_device_action(action_param)
+            success, code, msg = summarize(result)
+            payload = {"result": result}
+        else:
+            results = await miot_proxy.set_device_properties(prop_params)
+            success, code, msg = summarize(results)
+            payload = {"results": results}
+    except Exception as e:
+        await _record("applied", success=False, error=str(e))
+        raise
+
+    await _record(
+        "applied", success=success, result_code=code, result_msg=msg,
+        error=None if success else (msg or "miot_failed"),
+    )
+    return ControlOutcome(
+        payload=payload, success=success, result_code=code, result_msg=msg,
+        protected=decision.protected,
+    )
+
+
 class MiotService:
     """MiOT service class"""
 
@@ -310,6 +498,8 @@ class MiotService:
         self._notify_deduper = MessageDeduper(
             window_sec=get_settings().notify.dedup_window_sec
         )
+        # 受保护设备的待确认变更(进程内、带 TTL;为什么不放 action_ledger 见 gate.py)。
+        self._pending = PendingStore(ttl_sec=get_settings().safety.stage_ttl_sec)
 
     async def lru_snapshot(self) -> dict:
         return self._lru.load()
@@ -978,100 +1168,219 @@ class MiotService:
         }
 
     async def control_device(self, did: str, request: DeviceControlRequest) -> dict:
-        """Control device: set_property / set_properties / call_action."""
-        # 尝试参数先归一好,成功/异常路径共用——SDK/网络抛异常时台账也能看到
-        # agent 当时试图设置什么值 / 播什么 TTS / 什么参数。
-        attempted_value_json = _request_value_json(request)
+        """Control device: set_property / set_properties / call_action.
+
+        命中 ``safety.protected_categories`` 的设备**不执行**,而是 stage 一条待确认
+        变更并返回 ``{"staged": true, ...}``;其余设备经 :func:`execute_control`
+        (服务端值校验 + 台账)直接下发。
+        """
         try:
             await self._assert_did_in_allowed_home(did)
-
-            if request.type == "set_property":
-                if not request.iid:
-                    raise ValidationException("iid is required for set_property")
-                siid, piid = _parse_prop_iid(request.iid)
-                params = [
-                    MIoTSetPropertyParam(
-                        did=did, siid=siid, piid=piid, value=request.value
-                    )
-                ]
-                results = await self._miot_proxy.set_device_properties(params)
-                self._safe_lru_touch(did, [request.iid])
-                success, code, msg = summarize_results(results)
-                await _write_action_ledger(
-                    self._miot_proxy,
-                    action_type="set_property",
-                    did=did, iid=request.iid,
-                    value_json=attempted_value_json,
-                    result_code=code, result_msg=msg,
-                    success=success, error=None,
-                )
-                return {"results": results}
-
-            if request.type == "set_properties":
-                if not request.properties:
-                    raise ValidationException(
-                        "properties is required for set_properties"
-                    )
-                params = []
-                for prop in request.properties:
-                    siid, piid = _parse_prop_iid(prop.iid)
-                    params.append(
-                        MIoTSetPropertyParam(
-                            did=did, siid=siid, piid=piid, value=prop.value
-                        )
-                    )
-                results = await self._miot_proxy.set_device_properties(params)
-                self._safe_lru_touch(did, [p.iid for p in request.properties])
-                success, code, msg = summarize_results(results)
-                await _write_action_ledger(
-                    self._miot_proxy,
-                    action_type="set_properties",
-                    # 复数 iid 逗号拼接;value_json 存 {iid: value} 全集
-                    iid=_request_iid(request),
-                    did=did,
-                    value_json=attempted_value_json,
-                    result_code=code, result_msg=msg,
-                    success=success, error=None,
-                )
-                return {"results": results}
-
-            # call_action
-            if not request.iid:
-                raise ValidationException("iid is required for call_action")
-            siid, aiid = _parse_action_iid(request.iid)
-            param = MIoTActionParam(
-                did=did, siid=siid, aiid=aiid, in_=request.params or []
+            dev = await _resolve_device(self._miot_proxy, did)
+            decision = current_protection(dev)
+            if decision.protected:
+                return await self._stage_change(did, request, dev, decision)
+            outcome = await execute_control(
+                self._miot_proxy, did, request, source="cli"
             )
-            result = await self._miot_proxy.call_device_action(param)
-            self._safe_lru_touch(did, [request.iid])
-            success, code, msg = summarize_results(result)
-            # call_action 的 in_params 存 value_json —— speaker play-text 的 TTS 全文落这里
-            await _write_action_ledger(
-                self._miot_proxy,
-                action_type="call_action",
-                did=did, iid=request.iid,
-                value_json=attempted_value_json,
-                result_code=code, result_msg=msg,
-                success=success, error=None,
-            )
-            return {"result": result}
-
-        # 兜底：原写法 `except A, B:` 是 Python 2 语法，在 Python 3 上为 SyntaxError，
-        # 会导致本模块在 3.x 解释器下整个无法加载。修正为 Python 3 规范的元组捕获语法。
-        except (ValidationException, ResourceNotFoundException):
+            self._safe_lru_touch(did, _request_iids(request))
+            return outcome.payload
+        except (ValidationException, ResourceNotFoundException, AuthorizationException):
             raise
         except Exception as e:
             logger.error("Failed to control device %s: %s", did, e)
-            # 异常路径也落一行:success=0 + error + 尝试参数(失败审计完整性)
+            raise MiotServiceException(f"Failed to control device: {str(e)}") from e
+
+    # ---- 受保护设备:stage → 用户确认 → apply ----
+
+    async def _expire_pending(self) -> None:
+        """把过期的待确认变更移出存储,并为每条落一行 ``status=expired`` 台账。"""
+        for change in self._pending.purge_expired():
+            logger.info(
+                "device change expired change=%s did=%s", change.change_id, change.did
+            )
             await _write_action_ledger(
                 self._miot_proxy,
-                action_type=getattr(request, "type", None) or "call_action",
-                did=did, iid=_request_iid(request),
-                value_json=attempted_value_json,
+                action_type=change.request.type,
+                did=change.did, iid=_request_iid(change.request),
+                value_json=_request_value_json(change.request),
                 result_code=None, result_msg=None,
-                success=False, error=str(e),
+                success=False, error="staged change expired without confirmation",
+                source="cli", source_id=change.change_id,
+                status="expired", change_id=change.change_id, protected=True,
+                home_id=change.home_id,
             )
-            raise MiotServiceException(f"Failed to control device: {str(e)}") from e
+
+    async def _stage_change(
+        self, did: str, request: DeviceControlRequest, dev, decision: ProtectionDecision
+    ) -> dict:
+        """受保护设备:先做服务端值校验(错参立刻 422,落 rejected 台账),再 stage。
+
+        stage 行 ``status=staged, success=0``,带 change_id / protected=1;确认凭据
+        ``confirm_token`` 只在本次响应里出现一次,存储侧只留哈希。
+        """
+        await self._expire_pending()
+        try:
+            validate_request_against_spec(
+                await _fetch_spec_for(self._miot_proxy, dev), request
+            )
+        except ValidationException as e:
+            await _write_action_ledger(
+                self._miot_proxy,
+                action_type=request.type,
+                did=did, iid=_request_iid(request),
+                value_json=_request_value_json(request),
+                result_code=None, result_msg=None,
+                success=False, error=f"gate: {e.message}",
+                source="cli", status="rejected", protected=True,
+            )
+            raise
+        change, token = self._pending.stage(
+            did=did,
+            request=request,
+            category=decision.category or "?",
+            device_name=getattr(dev, "name", None),
+            room=getattr(dev, "room_name", None),
+            home_id=getattr(dev, "home_id", None),
+        )
+        logger.info(
+            "device control staged change=%s did=%s category=%s type=%s ttl=%ss",
+            change.change_id, did, decision.category, request.type,
+            int(self._pending.ttl_sec),
+        )
+        await _write_action_ledger(
+            self._miot_proxy,
+            action_type=request.type,
+            did=did, iid=_request_iid(request),
+            value_json=_request_value_json(request),
+            result_code=None, result_msg=None,
+            success=False, error=None,
+            source="cli", source_id=change.change_id,
+            status="staged", change_id=change.change_id, protected=True,
+            home_id=change.home_id,
+        )
+        return self._staged_response(change, token)
+
+    @staticmethod
+    def _staged_response(change: StagedChange, token: str) -> dict:
+        return {
+            "staged": True,
+            **change.public_view(),
+            "expires_at": ms_to_iso_local(change.expires_at_ms),
+            "confirm_token": token,
+            "next": (
+                f"设备属受保护类别 '{change.category}',本次控制**未执行**。请向用户复述 "
+                "summary 并等待用户明确同意;同意后再执行 "
+                f"`miloco-cli device apply {change.change_id} --token <confirm_token>`,"
+                f"用户拒绝则 `miloco-cli device discard {change.change_id}`。"
+                f"变更在 {ms_to_iso_local(change.expires_at_ms)} 过期。"
+            ),
+        }
+
+    async def list_changes(self) -> dict:
+        """列出待确认变更(不含 confirm_token)。"""
+        await self._expire_pending()
+        return {
+            "changes": [
+                {**c.public_view(), "expires_at": ms_to_iso_local(c.expires_at_ms)}
+                for c in self._pending.pending()
+            ]
+        }
+
+    def _get_pending_or_raise(self, change_id: str) -> StagedChange:
+        change = self._pending.get(change_id)
+        if change is None:
+            raise ResourceNotFoundException(
+                f"change '{change_id}' not found or expired "
+                f"(staged changes expire after {int(self._pending.ttl_sec)}s and do not "
+                "survive a backend restart); run `device changes` to list pending ones, "
+                "or stage the control again"
+            )
+        return change
+
+    async def discard_change(self, change_id: str) -> dict:
+        """用户拒绝 → 丢弃待确认变更并落 ``status=discarded`` 台账。"""
+        await self._expire_pending()
+        change = self._get_pending_or_raise(change_id)
+        self._pending.take(change_id)
+        logger.info("device change discarded change=%s did=%s", change_id, change.did)
+        await _write_action_ledger(
+            self._miot_proxy,
+            action_type=change.request.type,
+            did=change.did, iid=_request_iid(change.request),
+            value_json=_request_value_json(change.request),
+            result_code=None, result_msg=None,
+            success=False, error=None,
+            source="cli", source_id=change.change_id,
+            status="discarded", change_id=change.change_id, protected=True,
+            home_id=change.home_id,
+        )
+        return {"discarded": True, "change_id": change_id, "did": change.did}
+
+    async def apply_change(self, change_id: str, confirm_token: str | None) -> dict:
+        """用户确认后下发已 stage 的变更。
+
+        凭据一次性:token 匹配即从存储移出,无论随后成败都不可重放;猜错 token 不销毁
+        变更(落 ``apply_rejected`` 台账后 403)。apply 时按 *当前* 状态重新把关——
+        scope(设备仍在启用家庭)、spec 值校验、下发路径都与直接控制完全相同(复用
+        :func:`execute_control`,带同一个 change_id),stage 时通过不等于现在通过。
+        """
+        await self._expire_pending()
+        change = self._get_pending_or_raise(change_id)
+        if not self._pending.verify_token(change, confirm_token):
+            logger.warning(
+                "device change apply refused: token mismatch change=%s did=%s",
+                change_id, change.did,
+            )
+            await _write_action_ledger(
+                self._miot_proxy,
+                action_type=change.request.type,
+                did=change.did, iid=_request_iid(change.request),
+                value_json=_request_value_json(change.request),
+                result_code=None, result_msg=None,
+                success=False, error="gate: confirm_token mismatch",
+                source="cli", source_id=change.change_id,
+                status="apply_rejected", change_id=change.change_id, protected=True,
+                home_id=change.home_id,
+            )
+            raise AuthorizationException(
+                f"confirm_token does not match change '{change_id}'; ask the user for the "
+                "token returned when the control was staged (it is not derivable), or "
+                "stage the control again"
+            )
+        self._pending.take(change_id)  # 一次性:校验通过即移出,成败都不可重放
+        try:
+            try:
+                await self._assert_did_in_allowed_home(change.did)
+            except (ValidationException, ResourceNotFoundException) as e:
+                await _write_action_ledger(
+                    self._miot_proxy,
+                    action_type=change.request.type,
+                    did=change.did, iid=_request_iid(change.request),
+                    value_json=_request_value_json(change.request),
+                    result_code=None, result_msg=None,
+                    success=False, error=f"gate: {e.message}",
+                    source="cli", source_id=change.change_id,
+                    status="apply_rejected", change_id=change.change_id, protected=True,
+                    home_id=change.home_id,
+                )
+                raise
+            outcome = await execute_control(
+                self._miot_proxy, change.did, change.request,
+                source="cli", source_id=change.change_id, change_id=change.change_id,
+            )
+            self._safe_lru_touch(change.did, _request_iids(change.request))
+            logger.info(
+                "device change applied change=%s did=%s success=%s",
+                change_id, change.did, outcome.success,
+            )
+            return {"applied": True, "change_id": change_id, "did": change.did,
+                    **outcome.payload}
+        except (ValidationException, ResourceNotFoundException):
+            raise
+        except Exception as e:
+            logger.error("Failed to apply change %s (did=%s): %s", change_id, change.did, e)
+            raise MiotServiceException(f"Failed to apply change: {str(e)}") from e
 
     async def get_device_status(self, did: str, iids: list[str] | None) -> dict:
         """Get device property values. iids is list of 'prop.{siid}.{piid}' strings."""

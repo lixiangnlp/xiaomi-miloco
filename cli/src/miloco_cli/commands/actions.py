@@ -64,9 +64,12 @@ def _truncate(value_json: str | None) -> str:
 
 
 def _render_action_row(a: dict) -> str:
-    """ts|action_type|did|device_name|room|iid|success|reason|value 竖线分隔。
+    """ts|action_type|did|device_name|room|iid|success|reason|status|value 竖线分隔。
 
     与 device list 同款:每字段转义 ``|``(房间名 / 别名用户可改,含 ``|`` 不是不可能)。
+    ``status`` 是 v5 闸门列(applied / staged / rejected / apply_rejected / expired /
+    discarded),插在 reason 之后、value 之前:前 8 列位置不变,老解析方不受影响;
+    老后端不返回该字段时按 applied 渲染。
     """
     from miloco_cli.catalog import _escape
 
@@ -80,6 +83,7 @@ def _render_action_row(a: dict) -> str:
         _escape(a.get("iid")),
         "ok" if a.get("success") else "fail",
         _escape(reason),
+        _escape(a.get("status") or "applied"),
         _escape(_truncate(a.get("value_json"))),
     ])
 
@@ -93,11 +97,18 @@ def actions_group():
 @click.option("--since", default=None, help="起始时间:24h / 7d / 90m 相对量,或 ISO 8601")
 @click.option("--did", default=None, help="按设备 did 过滤")
 @click.option("--failed-only", is_flag=True, default=False, help="只看失败项")
+@click.option(
+    "--status", default=None,
+    type=click.Choice(
+        ["applied", "staged", "rejected", "apply_rejected", "expired", "discarded"]
+    ),
+    help="按闸门状态过滤(staged=待确认未执行 / applied=已下发 / rejected 等)",
+)
 @click.option("--limit", type=int, default=50, help="返回条数(默认 50,上限 500)")
-def actions_list(since, did, failed_only, limit):
+def actions_list(since, did, failed_only, status, limit):
     """列出动作审计流水(新到旧)。
 
-    顶部 TSV 头行,后跟:ts|action_type|did|device_name|room|iid|success|reason|value
+    顶部 TSV 头行,后跟:ts|action_type|did|device_name|room|iid|success|reason|status|value
     """
     from miloco_cli.client import api_get
 
@@ -108,12 +119,14 @@ def actions_list(since, did, failed_only, limit):
         params.append(("did", did))
     if failed_only:
         params.append(("failed_only", 1))
+    if status:
+        params.append(("status", status))
     if limit:
         params.append(("limit", limit))
 
     resp = api_get("/api/actions", params=params or None)
     rows = resp if isinstance(resp, list) else resp.get("data", [])
 
-    click.echo("# ts|action_type|did|device_name|room|iid|success|reason|value")
+    click.echo("# ts|action_type|did|device_name|room|iid|success|reason|status|value")
     for a in rows:
         click.echo(_render_action_row(a))

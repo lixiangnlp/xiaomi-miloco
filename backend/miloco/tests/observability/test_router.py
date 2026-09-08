@@ -188,3 +188,54 @@ async def test_list_actions_home_filter(app_with_db):
             assert [x["id"] for x in r.json()] == ["legacy", "h1-row"]
     finally:
         await client.stop()
+
+
+async def test_list_actions_status_filter(app_with_db):
+    """v5:``status=`` 可选过滤;不传即全部(老调用方不受影响),老行默认 applied。"""
+    from miloco.config import get_settings
+    from miloco.observability.types import ActionLedgerRecord
+
+    token = get_settings().server.token
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    app, _db, client = app_with_db
+    await client.start()
+    try:
+        client.record_action(ActionLedgerRecord(
+            id="a1", timestamp=1000, action_type="set_property", did="lamp",
+            device_name=None, room=None, iid="prop.2.1", value_json="true",
+            result_code=0, result_msg=None, success=True, error=None,
+        ))
+        client.record_action(ActionLedgerRecord(
+            id="s1", timestamp=2000, action_type="set_property", did="cam",
+            device_name=None, room=None, iid="prop.2.1", value_json="false",
+            result_code=None, result_msg=None, success=False, error=None,
+            status="staged", change_id="chg-1", protected=True,
+        ))
+        client.record_action(ActionLedgerRecord(
+            id="p1", timestamp=3000, action_type="set_property", did="cam",
+            device_name=None, room=None, iid="prop.2.1", value_json="false",
+            result_code=0, result_msg=None, success=True, error=None,
+            status="applied", change_id="chg-1", protected=True,
+        ))
+        await client.flush()
+
+        with TestClient(app) as tc:
+            rows = tc.get("/api/actions", headers=headers).json()
+            assert [x["id"] for x in rows] == ["p1", "s1", "a1"]
+            # 不带 status 的老写法默认 applied / protected=0 / change_id NULL
+            a1 = next(x for x in rows if x["id"] == "a1")
+            assert (a1["status"], a1["protected"], a1["change_id"]) == ("applied", 0, None)
+
+            rows = tc.get("/api/actions?status=staged", headers=headers).json()
+            assert [x["id"] for x in rows] == ["s1"]
+            assert rows[0]["change_id"] == "chg-1" and rows[0]["protected"] == 1
+
+            rows = tc.get("/api/actions?status=applied&did=cam", headers=headers).json()
+            assert [x["id"] for x in rows] == ["p1"]
+
+            # 与 failed_only 可叠加
+            rows = tc.get("/api/actions?status=staged&failed_only=1", headers=headers).json()
+            assert [x["id"] for x in rows] == ["s1"]
+    finally:
+        await client.stop()

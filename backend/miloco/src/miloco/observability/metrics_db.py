@@ -6,13 +6,15 @@ v0(无版本号老 db) → 要求删 db(无法判断列集)。
 
 v2:新增 action_ledger 表(agent 控制设备 / 播 TTS / 触发场景的持久审计)。
 纯 additive CREATE,对 v1 老库走 _MIGRATIONS 步进补表,无需删 db。
+v5:action_ledger 补 status / change_id / protected 三列(危险设备 stage / apply 闸门
+的审计口径),老行 status 默认 'applied'、protected 默认 0,语义不变。
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _TRACES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS traces (
@@ -132,6 +134,13 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_success ON agent_runs(success) WHERE s
 # source ∈ {cli, rule} 区分触发源(v3)：cli=control_device 路径 / rule=RuleRunner 直控
 # (source_id=rule_id)。trace_id 目前是**预留槽**(NULL)——尚未实际串联 agent turn,
 # 后续经 CLI --trace-id / X-Miloco-Trace-Id → ContextVar 串联(见 PR 后续工作)。
+# v5 闸门列(见 miot/gate.py):
+# - status:动作生命周期。applied=已进入下发(成败看 success)/ staged=受保护设备已
+#   stage 等用户确认,未下发 / rejected=服务端校验拒绝,未下发 / apply_rejected=apply
+#   凭据或复检失败,未下发 / expired=待确认变更过期作废 / discarded=用户放弃。
+# - change_id:stage → apply 同一变更的各行共用,便于按变更串起完整轨迹。
+# - protected:执行时刻设备是否命中 safety.protected_categories(规则路径放行受保护
+#   设备时也标 1,让“规则动了门锁”在台账里可检索)。
 _ACTION_LEDGER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS action_ledger (
   id            TEXT    NOT NULL PRIMARY KEY,
@@ -149,11 +158,17 @@ CREATE TABLE IF NOT EXISTS action_ledger (
   trace_id      TEXT,
   source        TEXT,
   source_id     TEXT,
-  home_id       TEXT
+  home_id       TEXT,
+  status        TEXT    NOT NULL DEFAULT 'applied',
+  change_id     TEXT,
+  protected     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_action_ledger_ts ON action_ledger(timestamp);
 CREATE INDEX IF NOT EXISTS idx_action_ledger_source_ts ON action_ledger(source, timestamp);
 CREATE INDEX IF NOT EXISTS idx_action_ledger_home_ts ON action_ledger(home_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_action_ledger_status_ts ON action_ledger(status, timestamp);
+CREATE INDEX IF NOT EXISTS idx_action_ledger_change ON action_ledger(change_id)
+  WHERE change_id IS NOT NULL;
 """
 
 _TRACES_V_VIEW = """
@@ -281,9 +296,39 @@ def _migrate_v4_action_home(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v5_action_status(conn: sqlite3.Connection) -> None:
+    """v4 → v5:给 action_ledger 补闸门三列 status / change_id / protected(幂等)。
+
+    危险设备控制改为服务端 stage / apply 后,一次控制在台账里可能是多行(staged →
+    applied / apply_rejected / expired / discarded),需要 status 标生命周期、
+    change_id 把同一变更串起来。老行全是“直接下发”的动作,status 默认 'applied'、
+    protected 默认 0,查询语义不变;ADD COLUMN 带常量 DEFAULT,SQLite 允许 NOT NULL。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
+    if "status" not in cols:
+        conn.execute(
+            "ALTER TABLE action_ledger ADD COLUMN status TEXT NOT NULL DEFAULT 'applied'"
+        )
+    if "change_id" not in cols:
+        conn.execute("ALTER TABLE action_ledger ADD COLUMN change_id TEXT")
+    if "protected" not in cols:
+        conn.execute(
+            "ALTER TABLE action_ledger ADD COLUMN protected INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_action_ledger_status_ts "
+        "ON action_ledger(status, timestamp)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_action_ledger_change "
+        "ON action_ledger(change_id) WHERE change_id IS NOT NULL"
+    )
+
+
 # 步进迁移注册表:{target_version: fn}。fn 只做 additive DDL,须幂等。
 _MIGRATIONS = {
     2: _migrate_v2_action_ledger,
     3: _migrate_v3_action_source,
     4: _migrate_v4_action_home,
+    5: _migrate_v5_action_status,
 }

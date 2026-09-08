@@ -155,6 +155,30 @@
         }
       }
     },
+    "safety": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "设备控制安全闸门（服务端强制）：受保护类别的控制先 stage、用户确认后 apply",
+      "properties": {
+        "protected_categories": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["lock", "camera", "video-doorbell", "gas-valve", "gas-sensor", "smoke-sensor"],
+          "description": "需要用户二次确认才能控制的设备类别（MIoT spec 类别名，即设备 urn 第 4 段）；空列表 = 关闭闸门（不推荐）"
+        },
+        "stage_ttl_sec": {
+          "type": "number",
+          "default": 600.0,
+          "description": "待确认变更的有效期（秒），过期后需重新发起；最小 1 秒"
+        },
+        "rule_protected": {
+          "type": "string",
+          "enum": ["deny", "allow"],
+          "default": "deny",
+          "description": "规则引擎静态动作命中受保护类别时的策略：deny=拒绝并落台账；allow=放行执行，台账行 source=rule 且 protected=1"
+        }
+      }
+    },
     "perception": {
       "type": "object",
       "additionalProperties": true,

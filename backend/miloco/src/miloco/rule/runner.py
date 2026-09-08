@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Literal, Mapping
 if TYPE_CHECKING:
     from miloco.task_record.service import TaskRecordService
 
-from miot.types import MIoTActionParam, MIoTGetPropertyParam, MIoTSetPropertyParam
+from miot.types import MIoTGetPropertyParam
 
 from miloco.database.rule_repo import RuleLogRepo
 from miloco.dispatch import dispatch_event
@@ -1457,8 +1457,8 @@ class RuleRunner:
           query current value, skip if already at target.
         - Cooldown path (idempotent=False with cooldown_minutes): skip if
           inside the time window since last successful exec.
-        - Dispatch via miot_proxy.set_device_properties /
-          call_device_action and report success.
+        - Dispatch via ``miot.service.execute_control``(与 CLI / web 同一执行核心:
+          受保护类别闸门 + 服务端值校验 + action_ledger)and report success.
 
         Cooldown state: ``self._state[rule_id].action_cooldown[(did, iid)]``.
         """
@@ -1503,68 +1503,42 @@ class RuleRunner:
                 action=action, result=True, skipped=True
             )
 
-        # Execute. rule static 直控不经 MiotService.control_device,故这里显式落 action_ledger
-        # ——复用同一个 _write_action_ledger helper(source=rule),避免两套组装逻辑漂移。
-        import json as _json
+        # Execute. 规则静态动作与 CLI / web 走同一个 execute_control(显式调用,镜像
+        # 上面 _trigger_scene 的复用方式):受保护类别闸门、服务端值校验、action_ledger
+        # (source=rule / source_id=rule_id)都在里面定义一次,这里不再另写一套。
+        # 受保护设备的策略取 safety.rule_protected:deny(默认,无人可确认 → 拒绝并落
+        # 台账)/ allow(规则是住户显式配置 → 放行,台账行 protected=1 可检索)。
+        from miloco.config import get_settings
+        from miloco.middleware.exceptions import ValidationException
+        from miloco.miot.schema import DeviceControlRequest
+        from miloco.miot.service import execute_control
 
-        from miloco.miot.service import _write_action_ledger
-
-        # 台账元组先归一好,成功/异常路径共用——SDK/网络抛异常时台账也要能看到
-        # 规则当时试图设置什么值 / 什么参数(失败审计完整性)。
-        _ltype = "set_property" if is_prop else "call_action"
-        try:
-            _lvalue = _json.dumps(
-                action.value if is_prop else (action.params or []),
-                ensure_ascii=False,
+        if is_prop:
+            request = DeviceControlRequest(
+                type="set_property", iid=action.iid, value=action.value
             )
-        except Exception:
-            _lvalue = None  # 参数不可序列化时不反噬规则执行
-
-        try:
-            if is_prop:
-                params = [
-                    MIoTSetPropertyParam(
-                        did=action.did, siid=siid, piid=p_a_id, value=action.value
-                    )
-                ]
-                results = await self._miot_proxy.set_device_properties(params)
-                success, _lcode, _lmsg = _summarize_rule_result(results)
-            else:
-                param = MIoTActionParam(
-                    did=action.did,
-                    siid=siid,
-                    aiid=p_a_id,
-                    in_=action.params or [],
-                )
-                result = await self._miot_proxy.call_device_action(param)
-                success, _lcode, _lmsg = _summarize_rule_result(result)
-            # 有实际结果时与 control_device 同口径(负码即失败,镜像 #394,msg 是失败码
-            # 释义);空/不可判定返回按失败处理(见 _summarize_rule_result:未确认的执行
-            # 不能写 cooldown)。台账 result_msg 不再恒 NULL。
-            err: str | None = None if success else (_lmsg or "miot_failed")
-
-            await _write_action_ledger(
-                self._miot_proxy,
-                action_type=_ltype, did=action.did, iid=action.iid,
-                value_json=_lvalue, result_code=_lcode, result_msg=_lmsg,
-                success=success, error=err, source="rule", source_id=rule_id,
+        else:
+            request = DeviceControlRequest(
+                type="call_action", iid=action.iid, params=action.params or []
             )
-
-            if success:
-                self._mark_cooldown(rule_id, action)
-
+        try:
+            outcome = await execute_control(
+                self._miot_proxy, action.did, request,
+                source="rule", source_id=rule_id,
+                on_protected=get_settings().safety.rule_protected,
+                # 规则语义:空/不可判定返回 = 失败(未确认的执行不能写 cooldown)
+                summarize=_summarize_rule_result,
+            )
+        except ValidationException as e:
+            # 闸门 / 值校验拒绝:台账已由 execute_control 落,这里只归一结果
+            logger.warning(
+                "Rule %s action %s %s refused by gate: %s",
+                rule_id, action.did, action.iid, e.message,
+            )
             return RuleActionExecuteResult(
-                action=action, result=success, error=err
+                action=action, result=False, error=f"gate_refused: {e.message}"
             )
-
         except Exception as e:
-            await _write_action_ledger(
-                self._miot_proxy,
-                action_type=_ltype,
-                did=action.did, iid=action.iid, value_json=_lvalue,
-                result_code=None, result_msg=None,
-                success=False, error=str(e), source="rule", source_id=rule_id,
-            )
             logger.error(
                 "Failed to execute action %s %s: %s",
                 action.did, action.iid, e,
@@ -1572,6 +1546,15 @@ class RuleRunner:
             return RuleActionExecuteResult(
                 action=action, result=False, error=f"exception: {e}"
             )
+
+        # 有实际结果时与 control_device 同口径(负码即失败,msg 是失败码释义);
+        # 空/不可判定返回按失败处理(见 _summarize_rule_result)。
+        err: str | None = (
+            None if outcome.success else (outcome.result_msg or "miot_failed")
+        )
+        if outcome.success:
+            self._mark_cooldown(rule_id, action)
+        return RuleActionExecuteResult(action=action, result=outcome.success, error=err)
 
     # ---- Agent 回调路径 ----
 

@@ -146,12 +146,15 @@ def list_actions(
     action_type: str | None = None,
     home_id: str | None = None,
     failed_only: int | None = None,
+    status: str | None = None,
     limit: int = 50,
 ):
     """action_ledger 列表:agent 控制设备 / 播 TTS / 触发场景的持久审计,新到旧排序。
 
     action_ledger 表落在 observability.db(与本 router 其余 endpoint 同库),故放这里。
     limit 默认 50,上限 500(与 device/actions CLI 的分页节奏对齐,防一次拉全表)。
+    ``status`` 可选(v5):applied / staged / rejected / apply_rejected / expired /
+    discarded,不传即全部——向后兼容老调用方。
     """
     limit = max(1, min(limit, 500))
     db_path = request.app.state.obs_db_path
@@ -178,6 +181,9 @@ def list_actions(
             params.append(home_id)
         if failed_only:
             clauses.append("success = 0")
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM action_ledger {where} ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)

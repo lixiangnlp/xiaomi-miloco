@@ -3,8 +3,8 @@ name: miloco-devices
 description: 查询与控制米家智能家居设备。查询能力包括设备开关状态、运行状态、电量、设定温度、当前温湿度、PM2.5 等环境与设备数据；控制能力包括开关灯、调节空调温度/模式/风速、控制窗帘开合、启动或停止扫地机器人、开关摄像头等设备操作；场景能力包括触发已有米家场景，如回家、离家、睡眠等智能场景；以及刷新设备列表缓存。
 metadata:
   author: miloco
-  version: "1.7"
-  date: "2026-06-14"
+  version: "1.8"
+  date: "2026-09-08"
   openclaw:
     requires:
       bins: ["miloco-cli"]
@@ -109,20 +109,21 @@ miloco-cli device control 4962 --set target-temperature 26 --set on@空调 true
 
 ### 步骤 5 · 安全分流
 
-本步只**分流、不下发**：把步骤 4 生成的命令按是否安全分成**普通批 / 危险批**，交给步骤 6 的下发回合。
+**危险设备的二次确认由服务端强制**：门锁 / 摄像头 / 可视门铃 / 燃气阀 / 燃气 / 烟雾报警器等受保护类别（以后端 `safety.protected_categories` 为准）的 control / action 不会直接执行，后端把它 **stage** 成待确认变更并返回 `staged=true`。本步只**分流、不下发**，把步骤 4 生成的命令分成两批：
 
-- **危险批**：**门锁 / 摄像头 / 燃气阀 / 烟雾报警器** 等安全设备的控制 / 动作（断电、开关机、开锁、关阀）——需二次确认。
-- **普通批**：其余设备的 control / action，以及**所有设备的 props 查询**。
+- **危险批**：受保护类别设备的控制 / 动作（断电、开关机、开锁、关阀）。下发后拿到的是 `{staged, change_id, summary, expires_at, confirm_token, next}`，设备**尚未动作**；需要用户确认后再 `device apply`。
+- **普通批**：其余设备的 control / action，以及**所有设备的 props 查询**，直接生效。
+- 分流按类别判断即可，判错也无妨：**服务端是最终裁定**——任何控制返回 `staged` 都按危险批处理，任何直接返回 `results` 的都已执行。
 - 没有危险指令 → 全部归普通批，下发回合只跑第 1 轮。
 
 ### 步骤 6 · 下发和回复
 
 一个「回合」=**下发（6.1）→ 回复（6.2）**。按步骤 5 的分流结果，最多跑两轮：
 
-1. **第 1 轮 · 普通批**：下发后**回复时附上所有危险指令的二次确认**，让用户确认。
-2. **第 2 轮 · 危险批**：仅把用户同意的危险指令再下发一遍；未同意的跳过。无危险指令则只有第 1 轮。
+1. **第 1 轮 · 下发 + 请求确认**：普通批和危险批一起下发。普通批直接生效；危险批返回 `staged`，记住每条的 `change_id` 与 `confirm_token`，**回复时复述其 `summary` 请用户确认**（“确定要关闭客厅摄像头吗？”）。不要把 token 念给用户，也不要在用户未同意时调用 apply。
+2. **第 2 轮 · apply / discard**：用户明确同意 → `miloco-cli device apply <change_id> --token <confirm_token>`（服务端会按当时配置重新校验 scope 与参数，再真正下发；token 一次性）。用户拒绝 → `miloco-cli device discard <change_id>`。未答复 → 不执行。变更默认 10 分钟过期、后端重启即作废，过期后重新走第 1 轮 stage。无危险指令则只有第 1 轮。
 
-> "关客厅灯，顺便关摄像头" → 先把客厅灯关掉、回复"灯已关闭，确定要关闭摄像头吗？"（第 1 轮：普通批下发 + 危险确认）；用户确认后才 `device control` 关摄像头（第 2 轮）。
+> “关客厅灯，顺便关摄像头” → 第 1 轮：灯直接关闭，摄像头返回 `staged`；回复“灯已关闭；摄像头尚未关闭，确定要关吗？”。用户确认后第 2 轮 `device apply chg-xxxx --token …`，回复“摄像头已关闭”。
 
 **6.1 下发**
 
@@ -183,12 +184,15 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 | 多设备同名 | 列候选追问 | "找到2个，哪个？" |
 | spec_name 多匹配 | CLI 报 "matches N iids" → 按建议重发 | （自动处理） |
 | 用 control 调 action | CLI 报 "is an action… 请改用 device action" → 切 `device action` | （自动处理） |
+| 返回 `staged=true` | 设备未执行；复述 `summary` 请用户确认，同意后 `device apply <change_id> --token <confirm_token>`，拒绝则 `device discard` | “确定要关闭摄像头吗？” |
+| apply 报 token 不匹配（403）/ change 不存在或过期 | 不猜 token、不重试 apply；过期或丢失就重新下发一次 control 拿新的 `change_id` 再确认 | “确认已过期，我重新发起一次” |
+| 后端报 `read-only` / `not in device spec` / 参数数量不匹配 | 服务端按 spec 校验拒绝（422）→ 按提示改对重发 | （自动处理） |
 | CLI 超时 | 3 秒后重试一次 | "超时，重试中…" |
 
 ## 关键规则
 
 1. **`spec_name` / action `iid` 不硬编码**——以 catalog / `device spec` 为准（`@` 后缀、`play-text` 等因设备而异）。
-2. **安全设备控制必须二次确认**——门锁/摄像头/燃气阀/烟雾报警器（步骤5）。
+2. **安全设备控制必须二次确认**——门锁/摄像头/可视门铃/燃气阀/烟雾报警器由**服务端 stage**，返回 `staged` 后先问用户，同意才 `device apply`；未同意绝不 apply（步骤5/6）。
 3. **控制非 on 属性强制补该设备实际开关 spec_name**（并入同一条 `--set`，可能 `on@空调`，非字面 `on`）——不查不分轮（步骤4）。
 4. **离线设备照常下命令**——由 CLI 兜底。
 
@@ -220,4 +224,4 @@ miloco-cli device control 4912 --set brightness 30 --set on true ; miloco-cli de
 
 **多候选必追问** — "把灯调暗一点"：全屋多盏灯分散在各房间，用户没指明哪台、也没说"全部" → grep 枚举后**反问"哪个房间的灯？"**，既不默认挑一台、也不擅自全做（对照上面"灯**都**调30%"是明确全体 → 才全做）。
 
-**安全设备** — "关客厅灯，顺便关摄像头"：🔒 先关灯下发（普通）；回复"灯已关闭，确定要关闭摄像头吗？"（普通结果 + 危险确认）；用户确认后才 `device control cam_001 on false`。
+**安全设备** — “关客厅灯，顺便关摄像头”：🔒 两条一起下发，灯直接关闭，`device control cam_001 on false` 返回 `staged`（`change_id=chg-xxxx`，设备未动）；回复“灯已关闭，确定要关闭摄像头吗？”；用户确认后 `device apply chg-xxxx --token <confirm_token>` 才真正关闭。

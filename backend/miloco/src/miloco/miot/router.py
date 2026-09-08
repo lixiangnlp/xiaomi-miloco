@@ -24,6 +24,7 @@ from miloco.middleware import (
 )
 from miloco.middleware.exceptions import HTTPException
 from miloco.miot.schema import (
+    ApplyChangeRequest,
     AuthorizeRequest,
     CameraCropToggleRequest,
     CameraPromptRequest,
@@ -279,9 +280,56 @@ async def control_device(
         request.type,
     )
     data = await manager.miot_service.control_device(did, request)
+    if isinstance(data, dict) and data.get("staged"):
+        # 受保护类别:未执行,等用户确认后 POST /changes/{id}/apply
+        return NormalResponse(
+            code=0, message="Device control staged, awaiting user confirmation", data=data
+        )
     return NormalResponse(
         code=0, message="Device control executed successfully", data=data
     )
+
+
+@router.get(
+    path="/changes",
+    summary="List staged device changes awaiting user confirmation",
+    response_model=NormalResponse,
+)
+async def list_changes(current_user: str = Depends(verify_token)):
+    """受保护设备的待确认变更列表(不含 confirm_token)。"""
+    data = await manager.miot_service.list_changes()
+    return NormalResponse(code=0, message="ok", data=data)
+
+
+@router.post(
+    path="/changes/{change_id}/apply",
+    summary="Apply a staged device change with the one-time confirm token",
+    response_model=NormalResponse,
+)
+async def apply_change(
+    change_id: str,
+    request: ApplyChangeRequest,
+    current_user: str = Depends(verify_token),
+):
+    """用户确认后下发:token 一次性(常量时间比较);apply 时重查 scope / 重跑值校验。"""
+    logger.info(
+        "Apply change API called, user: %s, change_id: %s", current_user, change_id
+    )
+    data = await manager.miot_service.apply_change(change_id, request.confirm_token)
+    return NormalResponse(code=0, message="Staged change applied", data=data)
+
+
+@router.delete(
+    path="/changes/{change_id}",
+    summary="Discard a staged device change",
+    response_model=NormalResponse,
+)
+async def discard_change(change_id: str, current_user: str = Depends(verify_token)):
+    logger.info(
+        "Discard change API called, user: %s, change_id: %s", current_user, change_id
+    )
+    data = await manager.miot_service.discard_change(change_id)
+    return NormalResponse(code=0, message="Staged change discarded", data=data)
 
 
 @router.get(

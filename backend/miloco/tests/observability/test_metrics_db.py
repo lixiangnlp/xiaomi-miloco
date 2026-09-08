@@ -220,6 +220,7 @@ def test_action_ledger_columns(tmp_path):
         "id", "timestamp", "action_type", "did", "device_name", "room",
         "iid", "value_json", "result_code", "result_msg", "success",
         "error", "trace_id", "source", "source_id", "home_id",
+        "status", "change_id", "protected",
     }
 
 
@@ -345,3 +346,64 @@ def test_v1_to_v2_migration_adds_action_ledger(tmp_path):
     assert conn.execute(
         "SELECT trace_id FROM traces"
     ).fetchone()[0] == "t1"
+
+
+def test_v4_to_v5_migration_adds_gate_columns(tmp_path):
+    """模拟 v4 库(action_ledger 无 status / change_id / protected,user_version=4),
+    init_schema 应 additive 补三列 + 索引 + 推到 v5,不丢数据;老行 status 默认
+    'applied'、protected 默认 0(语义不变);重复 init 幂等。"""
+    db = tmp_path / "obs.db"
+    conn = connect(db)
+    conn.execute("CREATE TABLE traces (trace_id TEXT PRIMARY KEY, timestamp INTEGER)")
+    conn.execute("CREATE TABLE traces_device (device_trace_id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE events (event_id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE agent_runs (run_id TEXT PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE action_ledger (id TEXT PRIMARY KEY, timestamp INTEGER, "
+        "action_type TEXT, did TEXT, success INTEGER, source TEXT, source_id TEXT, "
+        "home_id TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO action_ledger (id, timestamp, action_type, did, success, source, home_id) "
+        "VALUES ('a1', 111, 'set_property', 'd1', 1, 'cli', 'H1')"
+    )
+    conn.execute("PRAGMA user_version = 4")
+
+    init_schema(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
+    assert {"status", "change_id", "protected"} <= cols
+    # 老行仍在:status 默认 applied、change_id NULL、protected 0
+    assert conn.execute(
+        "SELECT id, status, change_id, protected FROM action_ledger WHERE id='a1'"
+    ).fetchone() == ("a1", "applied", None, 0)
+    # 新行可以写 staged + change_id
+    conn.execute(
+        "INSERT INTO action_ledger (id, timestamp, action_type, did, success, status, "
+        "change_id, protected) VALUES ('a2', 222, 'set_property', 'cam', 0, 'staged', "
+        "'chg-1', 1)"
+    )
+    assert conn.execute(
+        "SELECT status, change_id, protected FROM action_ledger WHERE id='a2'"
+    ).fetchone() == ("staged", "chg-1", 1)
+    idx = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+    assert {"idx_action_ledger_status_ts", "idx_action_ledger_change"} <= idx
+
+    # 幂等:再 init 一次不报错、列不重复
+    init_schema(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+def test_fresh_db_action_ledger_status_defaults(tmp_path):
+    """全新库:不带 status / protected 的 INSERT(v5 之前的写法)也得到默认值。"""
+    conn = connect(tmp_path / "obs.db")
+    init_schema(conn)
+    conn.execute(
+        "INSERT INTO action_ledger (id, timestamp, action_type, did, success) "
+        "VALUES ('x', 1, 'call_action', 'd', 1)"
+    )
+    assert conn.execute(
+        "SELECT status, change_id, protected FROM action_ledger WHERE id='x'"
+    ).fetchone() == ("applied", None, 0)
