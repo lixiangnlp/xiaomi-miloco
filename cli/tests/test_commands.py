@@ -2541,3 +2541,197 @@ def test_rule_create_scene_action_string_cooldown_no_traceback(runner):
     assert "Traceback" not in combined
     assert "TypeError" not in combined
     assert result.exit_code == 0
+
+
+# ─── device resolve ──────────────────────────────────────────────────────────
+
+
+def _resolve_envelope(candidates, ambiguity="none", action="set", preview=None, hint="ok"):
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "action": action,
+            "room": None,
+            "matched_by": "category",
+            "candidates": candidates,
+            "ambiguity": ambiguity,
+            "hint": hint,
+            "command_preview": preview or [],
+        },
+    }
+
+
+def _cand(did, iid="prop.2.1", spec_name="on", value=True, needs_on=None, issue=None, matched_by="category"):
+    c = {
+        "did": did,
+        "name": did,
+        "room": "卧室",
+        "category": "light",
+        "online": True,
+        "matched_by": matched_by,
+        "spec": {"spec_name": spec_name, "iid": iid, "access": "wr", "format": "bool", "matched_by": "synonym"},
+        "needs_on": needs_on,
+        "protected": False,
+        "value": value,
+    }
+    if issue:
+        c["issue"] = issue
+    return c
+
+
+def test_device_resolve_posts_request_and_prints_envelope(runner):
+    env = _resolve_envelope([_cand("AC1")])
+    with patch("miloco_cli.client.api_post") as mock:
+        mock.return_value = env
+        result = runner.invoke(
+            cli,
+            ["device", "resolve", "--room", "卧室", "--target", "空调", "--property", "温度", "--value", "26"],
+        )
+    assert result.exit_code == 0
+    mock.assert_called_once_with(
+        "/api/miot/intent/resolve",
+        {"room": "卧室", "target": "空调", "action": None, "property": "温度", "value": 26, "scope": "auto"},
+    )
+    assert json.loads(result.output)["data"]["ambiguity"] == "none"
+
+
+def test_device_resolve_value_inference_and_multi_values(runner):
+    with patch("miloco_cli.client.api_post") as mock:
+        mock.return_value = _resolve_envelope([])
+        runner.invoke(cli, ["device", "resolve", "--target", "灯", "--property", "开", "--value", "true"])
+        assert mock.call_args.args[1]["value"] is True
+        runner.invoke(
+            cli,
+            ["device", "resolve", "--target", "音箱", "--action", "call", "--property", "play-text",
+             "--value", "你好", "--value", "false", "--scope", "all"],
+        )
+        body = mock.call_args.args[1]
+        assert body["value"] == ["你好", False]
+        assert body["action"] == "call"
+        assert body["scope"] == "all"
+        # 未给 --value → null
+        runner.invoke(cli, ["device", "resolve", "--target", "灯"])
+        assert mock.call_args.args[1]["value"] is None
+
+
+def test_device_resolve_exec_runs_each_candidate_without_home_info(runner):
+    """--exec：一次进程内顺序下发；iid 来自后端解析结果，不再拉 home_info。"""
+    env = _resolve_envelope(
+        [
+            _cand("L1", iid="prop.2.2", spec_name="brightness", value=30,
+                  needs_on={"spec_name": "on", "iid": "prop.2.1"}),
+            _cand("L2", iid="prop.2.2", spec_name="brightness", value=30,
+                  needs_on={"spec_name": "on", "iid": "prop.2.1"}),
+        ],
+        preview=["miloco-cli device control L1 --set brightness 30 --set on true",
+                 "miloco-cli device control L2 --set brightness 30 --set on true"],
+    )
+    ctrl_ok = {"code": 0, "message": "Device control executed successfully", "data": {"results": [{"code": 0}]}}
+    with patch("miloco_cli.client.api_post", side_effect=[env, ctrl_ok, ctrl_ok]) as mock, patch(
+        "miloco_cli.home_info._fetch", side_effect=AssertionError("home_info must not be fetched")
+    ):
+        result = runner.invoke(
+            cli, ["device", "resolve", "--target", "所有灯", "--property", "亮度", "--value", "30", "--exec"]
+        )
+    assert result.exit_code == 0, result.output
+    assert mock.call_count == 3
+    assert mock.call_args_list[1].args == (
+        "/api/miot/devices/L1/control",
+        {"type": "set_properties", "properties": [
+            {"iid": "prop.2.2", "value": 30}, {"iid": "prop.2.1", "value": True},
+        ]},
+    )
+    assert mock.call_args_list[2].args[0] == "/api/miot/devices/L2/control"
+    lines = [json.loads(line) for line in result.output.strip().splitlines()]
+    assert [line["data"]["did"] for line in lines] == ["L1", "L2"]
+
+
+def test_device_resolve_exec_single_property_uses_set_property_and_annotates(runner):
+    env = _resolve_envelope([_cand("L1", value=False)])
+    offline = {"code": 0, "message": "ok", "data": {"results": [{"code": -704042011}]}}
+    with patch("miloco_cli.client.api_post", side_effect=[env, offline]) as mock:
+        result = runner.invoke(cli, ["device", "resolve", "--target", "台灯", "--property", "关", "--exec"])
+    assert result.exit_code == 0
+    assert mock.call_args_list[1].args[1] == {"type": "set_property", "iid": "prop.2.1", "value": False}
+    out = json.loads(result.output)
+    assert out["data"]["did"] == "L1"
+    assert out["data"]["results"][0]["code_msg"] == "设备离线"
+    assert out["code"] == -704042011
+
+
+def test_device_resolve_exec_refuses_when_ambiguous(runner):
+    env = _resolve_envelope([_cand("L1"), _cand("L2")], ambiguity="multiple", hint="请反问")
+    with patch("miloco_cli.client.api_post", return_value=env) as mock:
+        result = runner.invoke(cli, ["device", "resolve", "--target", "灯", "--property", "关", "--exec"])
+    assert result.exit_code == 1
+    assert mock.call_count == 1  # 只解析，未下发
+    assert json.loads(result.stdout)["data"]["ambiguity"] == "multiple"
+    assert "not executed" in result.stderr
+
+
+def test_device_resolve_exec_skips_candidates_with_issue(runner):
+    env = _resolve_envelope([
+        _cand("L1", iid="prop.2.2", spec_name="brightness", value=150, issue="值 150 超出范围 [1,100;1]"),
+    ])
+    with patch("miloco_cli.client.api_post", return_value=env) as mock:
+        result = runner.invoke(
+            cli, ["device", "resolve", "--target", "台灯", "--property", "亮度", "--value", "150", "--exec"]
+        )
+    assert result.exit_code == 1
+    assert mock.call_count == 1
+    assert "no runnable candidate" in result.stderr
+
+
+def test_device_resolve_exec_skips_light_control_fallback_candidates(runner):
+    """issue #36：可能控灯的开关只作提示，--exec 只下发真正命中的灯。"""
+    env = _resolve_envelope(
+        [_cand("L1", value=False), _cand("SW1", value=False, matched_by="light-control-fallback")],
+        preview=["miloco-cli device control L1 --set on false"],
+    )
+    ok = {"code": 0, "message": "ok", "data": {"results": [{"code": 0}]}}
+    with patch("miloco_cli.client.api_post", side_effect=[env, ok]) as mock:
+        result = runner.invoke(cli, ["device", "resolve", "--room", "客厅", "--target", "灯", "--property", "关", "--exec"])
+    assert result.exit_code == 0, result.output
+    assert mock.call_count == 2
+    assert mock.call_args_list[1].args[0] == "/api/miot/devices/L1/control"
+    assert json.loads(result.output)["data"]["did"] == "L1"
+
+    # 房间里只有开关 → 后端给 unconfirmed，--exec 拒绝执行
+    env = _resolve_envelope([_cand("SW1", matched_by="light-control-fallback")], ambiguity="unconfirmed", hint="请反问")
+    with patch("miloco_cli.client.api_post", return_value=env) as mock:
+        result = runner.invoke(cli, ["device", "resolve", "--room", "书房", "--target", "灯", "--property", "开", "--exec"])
+    assert result.exit_code == 1
+    assert mock.call_count == 1
+    assert "ambiguity=unconfirmed" in result.stderr
+
+
+def test_device_resolve_exec_get_and_call(runner):
+    get_env = _resolve_envelope(
+        [_cand("AC1", iid="prop.5.1", spec_name="temperature", value=None)], action="get"
+    )
+    status = {"code": 0, "message": "ok", "data": {"properties": [{"iid": "prop.5.1", "value": 24.5, "code": 0}]}}
+    with patch("miloco_cli.client.api_post", return_value=get_env), patch(
+        "miloco_cli.client.api_get", return_value=status
+    ) as mock_get:
+        result = runner.invoke(
+            cli, ["device", "resolve", "--target", "空调", "--action", "get", "--property", "温度", "--exec"]
+        )
+    assert result.exit_code == 0
+    mock_get.assert_called_once_with("/api/miot/devices/AC1/status", {"iid": "prop.5.1"})
+    out = json.loads(result.output)
+    assert out["data"]["properties"][0]["spec_name"] == "temperature"
+
+    call_env = _resolve_envelope(
+        [_cand("VAC1", iid="action.2.2", spec_name="start-charge", value=None)], action="call"
+    )
+    ok = {"code": 0, "message": "ok", "data": {"result": {"code": 0}}}
+    with patch("miloco_cli.client.api_post", side_effect=[call_env, ok]) as mock:
+        result = runner.invoke(
+            cli, ["device", "resolve", "--target", "扫地机", "--action", "call", "--property", "充电", "--exec"]
+        )
+    assert result.exit_code == 0
+    assert mock.call_args_list[1].args == (
+        "/api/miot/devices/VAC1/control",
+        {"type": "call_action", "iid": "action.2.2", "params": []},
+    )
