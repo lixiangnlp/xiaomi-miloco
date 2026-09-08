@@ -31,6 +31,7 @@ from miloco.middleware.exceptions import (
     ResourceNotFoundException,
     ValidationException,
 )
+from miloco.miot import intent as intent_resolver
 from miloco.miot.client import MiotProxy, build_sub_device_names
 from miloco.miot.filter import (
     MAX_CAMERA_PROMPT_LEN,
@@ -63,6 +64,7 @@ from miloco.miot.schema import (
     CameraInfo,
     DeviceControlRequest,
     DeviceInfo,
+    IntentResolveRequest,
     SceneInfo,
 )
 
@@ -976,6 +978,17 @@ class MiotService:
             "category": dev.urn.split(":")[3] if ":" in dev.urn else None,
             "spec": spec,
         }
+
+    async def resolve_intent(self, request: IntentResolveRequest) -> dict:
+        """把控制意图解析成候选设备 + spec + 命令预览（只解析、不下发）。
+
+        数据源就是 CLI catalog / device list 用的同一份 home_info（已按启用家庭过滤、
+        spec 走 MiotProxy 的 URN 缓存），解析规则见 :mod:`miloco.miot.intent`。
+        """
+        info = await self.get_home_info()
+        return intent_resolver.resolve_intent(
+            info.get("devices", []), request.model_dump()
+        )
 
     async def control_device(self, did: str, request: DeviceControlRequest) -> dict:
         """Control device: set_property / set_properties / call_action."""

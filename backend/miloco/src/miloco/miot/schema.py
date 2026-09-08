@@ -218,6 +218,29 @@ class DeviceControlRequest(BaseModel):
     params: list[Any] | None = Field(None, description="Input params for call_action")
 
 
+class IntentResolveRequest(BaseModel):
+    """设备控制意图解析请求（``POST /api/miot/intent/resolve``）。
+
+    字段全部是用户的自然措辞，由后端做确定性解析（房间 / 同义词 / spec / 值校验）。
+    """
+
+    room: str | None = Field(None, description="房间名（用户措辞），可空")
+    target: str = Field(
+        ..., min_length=1,
+        description="目标设备：设备名 / 别名 / 类别词（中英文均可），如“灯”“空调”“客厅的落地灯”",
+    )
+    action: Literal["set", "get", "call"] | None = Field(
+        None, description="set=控制属性 / get=查询属性 / call=调用动作；空则按 property/value 推断"
+    )
+    property: str | None = Field(
+        None, description="属性 / 动作的用户措辞，如“温度”“亮度”“开”“关”“充电”；控制时空则默认开关"
+    )
+    value: Any = Field(None, description="要设置的值 / 动作入参（列表为多参）")
+    scope: Literal["auto", "single", "all"] = Field(
+        "auto", description="auto=从 target 里识别“所有 / 都”等复数词；all=命中多台即全做；single=多台必反问"
+    )
+
+
 class SendNotifyRequest(BaseModel):
     notify: str = Field(..., description="Notification text", min_length=1)
 
